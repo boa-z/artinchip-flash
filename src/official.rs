@@ -612,19 +612,24 @@ mod tests {
 
     #[test]
     fn transport_selectors_precede_command() {
-        let mut args = OfficialArgs::default();
-        args.command = OfficialCommand::ListDevices;
-        args.device = "1:2".to_string();
-        args.uart_port = "COM3".to_string();
-        args.baudrate = "921600".to_string();
+        let args = OfficialArgs {
+            command: OfficialCommand::ListDevices,
+            device: "1:2".to_string(),
+            uart_port: "COM3".to_string(),
+            baudrate: "921600".to_string(),
+            ..Default::default()
+        };
         let out = build_args(&args).unwrap();
         assert_eq!(
             out,
             vec![
                 "--progress",
-                "--dev", "1:2",
-                "--uart", "COM3",
-                "--baudrate", "921600",
+                "--dev",
+                "1:2",
+                "--uart",
+                "COM3",
+                "--baudrate",
+                "921600",
                 "--list",
             ]
             .into_iter()
@@ -637,27 +642,28 @@ mod tests {
     fn empty_transport_selectors_are_omitted() {
         let args = OfficialArgs::default();
         let out = build_args(&args).unwrap();
-        assert!(!out.iter().any(|a| a == "--dev" || a == "--uart" || a == "--baudrate"));
+        assert!(!out
+            .iter()
+            .any(|a| a == "--dev" || a == "--uart" || a == "--baudrate"));
     }
 
     #[test]
     fn pre_burn_erase_passes_media_image_and_selectors() {
-        let out = pre_burn_erase_args(
-            "0",
-            Some(Path::new("fw.img")),
-            "1:2",
-            "COM3",
-            "921600",
-        )
-        .unwrap();
+        let out =
+            pre_burn_erase_args("0", Some(Path::new("fw.img")), "1:2", "COM3", "921600").unwrap();
         assert_eq!(
             out,
             vec![
                 "--progress",
-                "--dev", "1:2",
-                "--uart", "COM3",
-                "--baudrate", "921600",
-                "flasherase", "0", "fw.img",
+                "--dev",
+                "1:2",
+                "--uart",
+                "COM3",
+                "--baudrate",
+                "921600",
+                "flasherase",
+                "0",
+                "fw.img",
             ]
             .into_iter()
             .map(str::to_string)
@@ -671,16 +677,17 @@ mod tests {
     }
 
     fn bdefuse_args(command: OfficialCommand) -> OfficialArgs {
-        let mut args = OfficialArgs::default();
-        args.command = command;
         // Keep transport selectors empty so only the command words show.
-        args.address = "0xC0".to_string();
-        args.length = "64".to_string();
-        args.value = "00FF".to_string();
-        args.efuse_id = "0".to_string();
-        args.input = Some(PathBuf::from("in.bin"));
-        args.output = Some(PathBuf::from("out.bin"));
-        args
+        OfficialArgs {
+            command,
+            address: "0xC0".to_string(),
+            length: "64".to_string(),
+            value: "00FF".to_string(),
+            efuse_id: "0".to_string(),
+            input: Some(PathBuf::from("in.bin")),
+            output: Some(PathBuf::from("out.bin")),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -729,13 +736,15 @@ mod tests {
 
     #[test]
     fn bdefuse_requires_its_arguments() {
-        let mut empty = OfficialArgs::default();
         // Address/length/value carry non-empty defaults; clear them so the
         // "missing argument" paths are actually exercised.
-        empty.address = String::new();
-        empty.length = String::new();
-        empty.value = String::new();
-        empty.command = OfficialCommand::BdefuseSelect;
+        let mut empty = OfficialArgs {
+            command: OfficialCommand::BdefuseSelect,
+            address: String::new(),
+            length: String::new(),
+            value: String::new(),
+            ..Default::default()
+        };
         assert!(build_args(&empty).is_err());
         empty.command = OfficialCommand::BdefuseRead;
         assert!(build_args(&empty).is_err());
@@ -747,8 +756,10 @@ mod tests {
 
     #[test]
     fn bdreboot_takes_no_arguments() {
-        let mut args = OfficialArgs::default();
-        args.command = OfficialCommand::BdReboot;
+        let args = OfficialArgs {
+            command: OfficialCommand::BdReboot,
+            ..Default::default()
+        };
         let out = build_args(&args).unwrap();
         assert_eq!(
             out,

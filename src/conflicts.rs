@@ -224,9 +224,8 @@ pub fn report() -> String {
             "Conflicting services: none detected (no VMware/VirtualBox USB processes via pgrep); if USB open fails, quit hypervisors holding the board, then reconnect."
                 .to_string()
         } else {
-            let mut lines = vec![
-                "Conflicting services: possible hypervisor USB holders detected:".to_string(),
-            ];
+            let mut lines =
+                vec!["Conflicting services: possible hypervisor USB holders detected:".to_string()];
             for proc in &procs {
                 lines.push(format!("  {}", proc));
             }
@@ -244,9 +243,8 @@ pub fn report() -> String {
             "Conflicting services: none detected (no VMware/VirtualBox USB processes via pgrep); if USB open fails, quit hypervisors and other USB tools, then reconnect directly (avoid hubs)."
                 .to_string()
         } else {
-            let mut lines = vec![
-                "Conflicting services: possible hypervisor USB holders detected:".to_string(),
-            ];
+            let mut lines =
+                vec!["Conflicting services: possible hypervisor USB holders detected:".to_string()];
             for proc in &procs {
                 lines.push(format!("  {}", proc));
             }
@@ -327,6 +325,9 @@ DISPLAY_NAME: VirtualBox system service\r\n\
     #[test]
     fn empty_output_yields_no_conflicts() {
         assert!(filter_conflicts(parse_sc_query("")).is_empty());
-        assert!(filter_conflicts(parse_sc_query("[SC] EnumQueryServicesStatus:OpenService FAILED 5:\n")).is_empty());
+        assert!(filter_conflicts(parse_sc_query(
+            "[SC] EnumQueryServicesStatus:OpenService FAILED 5:\n"
+        ))
+        .is_empty());
     }
 }

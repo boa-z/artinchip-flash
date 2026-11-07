@@ -88,6 +88,45 @@ device in upgrade mode so you can retry (CLI exit code `130`).
 post-burn reset; `burn --erase-all` runs official `upgcmd flasherase`
 before the native burn (native erase is not reverse-engineered).
 
+## OS-only partition updates
+
+```sh
+# Validate the image and print the exact component plan (no device I/O)
+artinchip-flash burn firmware.img --partition os --plan
+artinchip-flash burn firmware.img --partition os --plan --json
+
+# Update only image.target.os (BROM upgrade mode, updater included)
+artinchip-flash burn firmware.img --partition os
+
+# Device already in the vendor bootloader upgrade mode (aicupg gotobl)
+artinchip-flash burn firmware.img --partition os --no-updater
+```
+
+`--partition` accepts repeatable or comma-separated names and selects only
+the matching `image.target.*` components; without it the legacy `spl,env,os`
+set is used.  Explicit selection also sends `UPG_MODE_PARTITION_UPGRADE`.
+
+Important: the D213 bootloader only stores/logs the mode byte
+(`aicupg_set_upg_cfg` in `upg_main.c`); the **component list sent by the host**
+is what limits the writes (`set_fwc_meta_cmd_end` resolves only the FWC's
+partition and `nand_fwc_start` parses only that partition string).  The plan is
+validated up front: META magic/name, image bounds, CRC32, unknown/duplicate
+partitions and zero targets are rejected before any device I/O.
+
+`--device <port-path|bus:address>` selects one physical device; multiple
+matching devices are rejected.  Reconnects re-select the same stable port path
+and never fall back to a different board.
+
+`--no-updater` is for a device already in the vendor bootloader upgrade mode
+(`aicupg gotobl`); it skips the RAM updater payload and writes `image.info`
+plus the selected targets directly.
+
+Hardware note (D213EC-DEMO-V4-0): OS-only write completed in about 42 s.
+`env` and the first `os` block matched the image CRCs, and the `spl`/`env`
+CRCs were identical before/after two OS-only runs.  `rodata`/`data` are NFTL
+and are not readable with the linear `aic_nand_read_part` command, so they
+are reported as not verified; the plan never selects them.
+
 ## Updates
 
 Stable checks query GitHub Releases for semver `v*` tags (prereleases

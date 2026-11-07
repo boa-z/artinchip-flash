@@ -35,6 +35,16 @@ pub struct BurnOptions {
     /// Requires the device-side force-upgrade switch (Luban/Luban-Lite
     /// config, official manual §2.1.4); not verified on hardware.
     pub force_upgrade: bool,
+    /// Send `UPG_MODE_PARTITION_UPGRADE` instead of the full-disk mode.
+    ///
+    /// The D213 bootloader only stores/logs this byte; the actual write
+    /// scope is the host-side `selected_parts` list.  This flag records the
+    /// user's intent and is asserted by the wire tests.
+    pub partition_upgrade: bool,
+    /// Skip the updater components.  Use when the device is already in the
+    /// vendor bootloader upgrade mode (`aicupg gotobl`); this avoids the
+    /// BROM updater re-enumeration step.
+    pub no_updater: bool,
 }
 
 impl Default for BurnOptions {
@@ -48,6 +58,8 @@ impl Default for BurnOptions {
             burn_timeout: Duration::from_secs(60),
             cancel: None,
             force_upgrade: false,
+            partition_upgrade: false,
+            no_updater: false,
         }
     }
 }
@@ -58,6 +70,8 @@ impl Default for BurnOptions {
 pub fn upg_mode(options: &BurnOptions) -> u8 {
     if options.force_upgrade {
         UPG_MODE_BURN_IMG_FORCE
+    } else if options.partition_upgrade {
+        UPG_MODE_PARTITION_UPGRADE
     } else {
         UPG_MODE_FULL_DISK_UPGRADE
     }
@@ -67,6 +81,8 @@ pub fn upg_mode(options: &BurnOptions) -> u8 {
 pub fn upg_mode_name(options: &BurnOptions) -> &'static str {
     if options.force_upgrade {
         "force upgrade mode (BURN_IMG_FORCE, experimental)"
+    } else if options.partition_upgrade {
+        "partition upgrade mode"
     } else {
         "full-disk upgrade mode"
     }
@@ -84,7 +100,10 @@ fn check_cancelled(
     callback: &mut Option<&mut BurnCallback<'_>>,
 ) -> Result<(), String> {
     if is_cancelled(options) {
-        emit(callback, BurnEvent::Log("Burn cancelled by user".to_string()));
+        emit(
+            callback,
+            BurnEvent::Log("Burn cancelled by user".to_string()),
+        );
         return Err("Burn cancelled by user".to_string());
     }
     Ok(())
@@ -530,14 +549,13 @@ impl<T: UpgTransport> UpgDevice<T> {
         &mut self,
         media: &StorageMedia,
     ) -> Result<StorageGeometry, String> {
-        let resp =
-            self.cmd_hdr_data_resp(CMD_GET_STORAGE_GEOME, &media.to_bytes(), STORAGE_GEOMETRY_SIZE)?;
-        StorageGeometry::from_bytes(&resp.payload).ok_or_else(|| {
-            format!(
-                "Geometry response too short: {} bytes",
-                resp.payload.len()
-            )
-        })
+        let resp = self.cmd_hdr_data_resp(
+            CMD_GET_STORAGE_GEOME,
+            &media.to_bytes(),
+            STORAGE_GEOMETRY_SIZE,
+        )?;
+        StorageGeometry::from_bytes(&resp.payload)
+            .ok_or_else(|| format!("Geometry response too short: {} bytes", resp.payload.len()))
     }
 
     /// `ERASE_STORAGE` (0x1B): synchronous erase described by `args`
@@ -588,11 +606,12 @@ impl<T: UpgTransport> UpgDevice<T> {
         mut callback: Option<&mut BurnCallback<'_>>,
     ) -> Result<(), String> {
         check_cancelled(options, &mut callback)?;
+        let plan = plan_burn(img_data, metas, options)?;
         let classified = classify_components(metas, &options.selected_parts);
-        for line in burn_plan_lines(&classified) {
+        for line in format_plan_lines(&plan) {
             emit(&mut callback, BurnEvent::Log(line));
         }
-        log_verbose!("{}", burn_plan_lines(&classified).join("\n"));
+        log_verbose!("{}", format_plan_lines(&plan).join("\n"));
         emit(
             &mut callback,
             BurnEvent::Stage("Build component plan".to_string()),
@@ -605,11 +624,14 @@ impl<T: UpgTransport> UpgDevice<T> {
             .sum::<usize>();
         let mut overall_sent = 0usize;
 
+        // In bootloader upgrade mode the updater payload is neither needed
+        // nor accepted reliably; the caller opts in with --no-updater.
+        let need_updater = !options.no_updater;
         let updater_count = classified
             .iter()
             .filter(|c| c.kind == ComponentKind::Updater)
             .count();
-        if updater_count > 0 {
+        if updater_count > 0 && need_updater {
             emit(
                 &mut callback,
                 BurnEvent::Stage("Send updater components".to_string()),
@@ -665,6 +687,14 @@ impl<T: UpgTransport> UpgDevice<T> {
             if let Err(e) = self.get_hwinfo() {
                 return Err(format!("Bootloader probe after reconnect failed: {}", e));
             }
+        } else if updater_count > 0 {
+            emit(
+                &mut callback,
+                BurnEvent::Log(
+                    "Device is already in bootloader upgrade mode; skipping updater components."
+                        .to_string(),
+                ),
+            );
         } else {
             emit(
                 &mut callback,
@@ -729,9 +759,7 @@ impl<T: UpgTransport> UpgDevice<T> {
         if options.force_upgrade {
             emit(
                 &mut callback,
-                BurnEvent::Log(
-                    "Force upgrade: skipping reset (mutually exclusive)".to_string(),
-                ),
+                BurnEvent::Log("Force upgrade: skipping reset (mutually exclusive)".to_string()),
             );
         }
         if do_reset {
@@ -748,6 +776,7 @@ impl<T: UpgTransport> UpgDevice<T> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn send_component(
         &mut self,
         img_data: &[u8],
@@ -862,19 +891,15 @@ impl<T: UpgTransport> UpgDevice<T> {
 
         let actual_crc = crc32fast::hash(&img_data[offset..end]);
         if actual_crc != crc_expected {
-            emit(
-                callback,
-                BurnEvent::Log(format!(
-                    "WARNING: {} CRC mismatch, expected=0x{:08x}, actual=0x{:08x}",
-                    name, crc_expected, actual_crc
-                )),
-            );
-        } else {
-            emit(
-                callback,
-                BurnEvent::Log(format!("CRC OK (0x{:08x})", actual_crc)),
-            );
+            return Err(format!(
+                "{}: CRC mismatch (expected 0x{:08x}, actual 0x{:08x})",
+                name, crc_expected, actual_crc
+            ));
         }
+        emit(
+            callback,
+            BurnEvent::Log(format!("CRC OK (0x{:08x})", actual_crc)),
+        );
         emit(
             callback,
             BurnEvent::ComponentFinished {
@@ -938,17 +963,204 @@ fn target_part_selected(meta: &FwcMeta, selected_parts: &[String]) -> bool {
         .any(|part| partition == part || target_name == part || meta.name_str() == part)
 }
 
-fn burn_plan_lines(components: &[FirmwareComponent<'_>]) -> Vec<String> {
-    let mut lines = vec!["AiBurn-style component plan:".to_string()];
-    for component in components {
+/// One component in a validated host-side burn plan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BurnPlanComponent {
+    pub kind: &'static str,
+    pub name: String,
+    pub partition: String,
+    pub media: String,
+    pub size: u32,
+    pub crc: u32,
+    pub selected: bool,
+}
+
+/// Validated host-side burn plan.
+///
+/// The `mode` byte is informational to the D213 bootloader (it only stores
+/// and logs `SET_UPG_CFG`); the selected target components are the real
+/// write-scope filter.  See `nand_fwc.c`/`fwc_cmd.c` in Luban-Lite:
+/// `set_fwc_meta_cmd_end` resolves only the FWC's own partition and
+/// `nand_fwc_start` parses only that partition string.
+#[derive(Clone, Debug)]
+pub struct BurnPlan {
+    pub components: Vec<BurnPlanComponent>,
+    pub mode: u8,
+    pub total_bytes: usize,
+}
+
+/// Validate the image and selection, and build the exact component plan.
+///
+/// This never touches a device: callers can print the plan before burning.
+pub fn plan_burn(
+    img_data: &[u8],
+    metas: &[FwcMeta],
+    options: &BurnOptions,
+) -> Result<BurnPlan, String> {
+    if options.selected_parts.is_empty() {
+        return Err("No target partitions selected".to_string());
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for part in &options.selected_parts {
+        let part = part.trim();
+        if part.is_empty() {
+            return Err("Empty partition name in selection".to_string());
+        }
+        if !seen.insert(part.to_string()) {
+            return Err(format!("Duplicate partition '{}' in selection", part));
+        }
+    }
+
+    let classified = classify_components(metas, &options.selected_parts);
+    let mut names = std::collections::BTreeSet::new();
+    let mut target_parts: Vec<String> = Vec::new();
+    let mut info_count = 0usize;
+    let mut selected_count = 0usize;
+    let mut total = 0usize;
+    let mut components = Vec::with_capacity(classified.len());
+
+    for component in &classified {
+        let meta = component.meta;
+        let name = meta.name_str();
+        if name.is_empty() {
+            return Err("META entry with an empty name".to_string());
+        }
+        if !names.insert(name.to_string()) {
+            return Err(format!("Duplicate META component '{}'", name));
+        }
+        if meta.magic_str() != "META" {
+            return Err(format!(
+                "{}: invalid META magic '{}'",
+                name,
+                meta.magic_str()
+            ));
+        }
+        let size = meta.size_val();
+        let offset = meta.offset_val() as usize;
+        let end = offset
+            .checked_add(size as usize)
+            .ok_or_else(|| format!("{}: offset/size overflow", name))?;
+        if size == 0 || end > img_data.len() {
+            return Err(format!(
+                "{}: image range out of bounds (offset={:#x}, size={}, image_len={})",
+                name,
+                offset,
+                size,
+                img_data.len()
+            ));
+        }
+        let actual = crc32fast::hash(&img_data[offset..end]);
+        if actual != meta.crc_val() {
+            return Err(format!(
+                "{}: CRC mismatch (expected 0x{:08x}, actual 0x{:08x})",
+                name,
+                meta.crc_val(),
+                actual
+            ));
+        }
+
+        let media = meta.partition_media();
+        let kind = match component.kind {
+            ComponentKind::Updater => {
+                if !media.is_empty() && media != "ram" {
+                    return Err(format!("{}: updater must be a RAM component", name));
+                }
+                "updater"
+            }
+            ComponentKind::ImageInfo => {
+                info_count += 1;
+                if !media.is_empty() && media != "ram" {
+                    return Err(format!("{}: image.info must be a RAM component", name));
+                }
+                "image.info"
+            }
+            ComponentKind::Target => {
+                if meta.partition_str().is_empty() {
+                    return Err(format!("{}: target has no partition name", name));
+                }
+                if media.is_empty() || media == "ram" {
+                    return Err(format!("{}: target has no storage media", name));
+                }
+                target_parts.push(meta.partition_str().to_string());
+                if component.selected {
+                    selected_count += 1;
+                }
+                "target"
+            }
+            ComponentKind::Other => {
+                return Err(format!("{}: unsupported META component", name));
+            }
+        };
+        if kind != "target" || component.selected {
+            total += size as usize;
+        }
+        components.push(BurnPlanComponent {
+            kind,
+            name: name.to_string(),
+            partition: meta.partition_str().to_string(),
+            media: media.to_string(),
+            size,
+            crc: meta.crc_val(),
+            selected: component.selected,
+        });
+    }
+
+    if info_count != 1 {
+        return Err(format!(
+            "image.info must appear exactly once (found {})",
+            info_count
+        ));
+    }
+    for part in &options.selected_parts {
+        let part = part.trim();
+        let matches = target_parts
+            .iter()
+            .filter(|target| {
+                target.as_str() == part
+                    || format!("image.target.{}", target) == part
+                    || format!("image.target.{}", part) == **target
+            })
+            .count();
+        if matches == 0 {
+            return Err(format!(
+                "Unknown target partition '{}'; available: {}",
+                part,
+                target_parts.join(", ")
+            ));
+        }
+        if matches > 1 {
+            return Err(format!(
+                "Ambiguous target partition '{}' ({} matching components)",
+                part, matches
+            ));
+        }
+    }
+    if selected_count == 0 {
+        return Err("No target components selected".to_string());
+    }
+
+    Ok(BurnPlan {
+        components,
+        mode: upg_mode(options),
+        total_bytes: total,
+    })
+}
+
+pub fn format_plan_lines(plan: &BurnPlan) -> Vec<String> {
+    let mut lines = vec!["Burn plan:".to_string()];
+    for component in &plan.components {
         lines.push(format!(
-            "  {:?}: {} partition={} selected={}",
+            "  {}: {} partition={} media={} size={} crc=0x{:08x} selected={}",
             component.kind,
-            component.meta.name_str(),
-            component.meta.partition_str(),
+            component.name,
+            component.partition,
+            component.media,
+            component.size,
+            component.crc,
             component.selected
         ));
     }
+    lines.push(format!("  upgrade mode: 0x{:02x}", plan.mode));
     lines
 }
 
@@ -1073,10 +1285,16 @@ mod tests {
 
     fn make_meta(name: &str, partition: &str, offset: u32, size: u32, crc: u32) -> FwcMeta {
         let mut bytes = vec![0u8; 512];
-        bytes[0..8].copy_from_slice(b"FWC_META");
+        bytes[0..4].copy_from_slice(b"META");
         bytes[8..8 + name.len().min(64)].copy_from_slice(&name.as_bytes()[..name.len().min(64)]);
         bytes[72..72 + partition.len().min(64)]
             .copy_from_slice(&partition.as_bytes()[..partition.len().min(64)]);
+        let media = if name.starts_with("image.target.") {
+            "spi-nand"
+        } else {
+            "ram"
+        };
+        bytes[112..112 + media.len()].copy_from_slice(media.as_bytes());
         bytes[136..140].copy_from_slice(&offset.to_le_bytes());
         bytes[140..144].copy_from_slice(&size.to_le_bytes());
         bytes[144..148].copy_from_slice(&crc.to_le_bytes());
@@ -1101,7 +1319,11 @@ mod tests {
     fn pre_cancelled_burn_does_not_touch_transport() {
         let img = vec![0xABu8; 4096];
         let crc = crc32fast::hash(&img[0..2048]);
-        let metas = vec![make_meta("image.target.os", "os", 0, 2048, crc)];
+        let info_crc = crc32fast::hash(&img[2048..4096]);
+        let metas = vec![
+            make_meta("image.target.os", "os", 0, 2048, crc),
+            make_meta("image.info", "", 2048, 2048, info_crc),
+        ];
         let flag = Arc::new(AtomicBool::new(true));
         let options = BurnOptions {
             selected_parts: vec!["os".to_string()],
@@ -1109,6 +1331,8 @@ mod tests {
             burn_timeout: Duration::from_secs(5),
             cancel: Some(flag),
             force_upgrade: false,
+            partition_upgrade: false,
+            no_updater: false,
         };
         let mut dev = UpgDevice::new(MockTransport {
             writes: 0,
@@ -1131,7 +1355,11 @@ mod tests {
     fn cancel_mid_chunk_aborts_burn() {
         let img = vec![0xABu8; 4096];
         let crc = crc32fast::hash(&img[0..2048]);
-        let metas = vec![make_meta("image.target.os", "os", 0, 2048, crc)];
+        let info_crc = crc32fast::hash(&img[2048..4096]);
+        let metas = vec![
+            make_meta("image.target.os", "os", 0, 2048, crc),
+            make_meta("image.info", "", 2048, 2048, info_crc),
+        ];
         let flag = Arc::new(AtomicBool::new(false));
         let options = BurnOptions {
             selected_parts: vec!["os".to_string()],
@@ -1139,6 +1367,8 @@ mod tests {
             burn_timeout: Duration::from_secs(5),
             cancel: Some(flag.clone()),
             force_upgrade: false,
+            partition_upgrade: false,
+            no_updater: false,
         };
         let mut dev = UpgDevice::new(MockTransport {
             writes: 0,
@@ -1170,9 +1400,14 @@ mod tests {
 
     #[test]
     fn upg_mode_selects_force_upgrade_byte() {
-        assert_eq!(upg_mode(&BurnOptions::default()), UPG_MODE_FULL_DISK_UPGRADE);
+        assert_eq!(
+            upg_mode(&BurnOptions::default()),
+            UPG_MODE_FULL_DISK_UPGRADE
+        );
         let force = BurnOptions {
             force_upgrade: true,
+            partition_upgrade: false,
+            no_updater: false,
             ..Default::default()
         };
         assert_eq!(upg_mode(&force), UPG_MODE_BURN_IMG_FORCE);
@@ -1180,15 +1415,21 @@ mod tests {
 
     #[test]
     fn default_burn_uses_full_disk_mode_and_resets() {
-        let img = vec![0xABu8; 1024];
+        let img = vec![0xABu8; 2048];
         let crc = crc32fast::hash(&img[0..1024]);
-        let metas = vec![make_meta("image.target.os", "os", 0, 1024, crc)];
+        let info_crc = crc32fast::hash(&img[1024..2048]);
+        let metas = vec![
+            make_meta("image.target.os", "os", 0, 1024, crc),
+            make_meta("image.info", "", 1024, 1024, info_crc),
+        ];
         let options = BurnOptions {
             selected_parts: vec!["os".to_string()],
             reset_after_burn: true,
             burn_timeout: Duration::from_secs(5),
             cancel: None,
             force_upgrade: false,
+            partition_upgrade: false,
+            no_updater: false,
         };
         let mut dev = UpgDevice::new(MockTransport {
             writes: 0,
@@ -1201,7 +1442,10 @@ mod tests {
         });
         dev.burn_image_with_options(&img, &metas, &options, None)
             .expect("mock burn must succeed");
-        assert_eq!(dev.transport_mut().upg_modes, vec![UPG_MODE_FULL_DISK_UPGRADE]);
+        assert_eq!(
+            dev.transport_mut().upg_modes,
+            vec![UPG_MODE_FULL_DISK_UPGRADE]
+        );
         assert!(
             dev.transport_mut().saw_reset,
             "default burn must reset the device"
@@ -1210,9 +1454,13 @@ mod tests {
 
     #[test]
     fn force_upgrade_uses_force_mode_and_skips_reset() {
-        let img = vec![0xABu8; 1024];
+        let img = vec![0xABu8; 2048];
         let crc = crc32fast::hash(&img[0..1024]);
-        let metas = vec![make_meta("image.target.os", "os", 0, 1024, crc)];
+        let info_crc = crc32fast::hash(&img[1024..2048]);
+        let metas = vec![
+            make_meta("image.target.os", "os", 0, 1024, crc),
+            make_meta("image.info", "", 1024, 1024, info_crc),
+        ];
         // Even with reset_after_burn=true, force upgrade wins (mutually exclusive).
         let options = BurnOptions {
             selected_parts: vec!["os".to_string()],
@@ -1220,6 +1468,8 @@ mod tests {
             burn_timeout: Duration::from_secs(5),
             cancel: None,
             force_upgrade: true,
+            partition_upgrade: false,
+            no_updater: false,
         };
         let mut dev = UpgDevice::new(MockTransport {
             writes: 0,
@@ -1375,9 +1625,7 @@ mod tests {
             payload: &[u8],
             _policy: CswPolicy,
         ) -> Result<Option<AicCsw>, String> {
-            if payload.len() == 16
-                && payload[0..4] == AIC_UPG_SIGN_UPGC.to_le_bytes()
-            {
+            if payload.len() == 16 && payload[0..4] == AIC_UPG_SIGN_UPGC.to_le_bytes() {
                 // Command header (magic "UPGC"): record the command, the
                 // next write is its payload even when also 16 bytes long
                 // (e.g. an 8-byte WRITE of 8 data bytes).
@@ -1413,7 +1661,9 @@ mod tests {
             }
             if let Some((addr, len)) = self.pending_read.take() {
                 assert_eq!(len, read_len, "device answers exactly the READ length");
-                return Ok((0..len).map(|i| self.mem.get(&(addr + i)).copied().unwrap_or(0)).collect());
+                return Ok((0..len)
+                    .map(|i| self.mem.get(&(addr + i)).copied().unwrap_or(0))
+                    .collect());
             }
             Ok(vec![0u8; read_len as usize])
         }
@@ -1440,7 +1690,10 @@ mod tests {
             pending_read: None,
         });
         dev.write_memory(0x4000_0000, &[1, 2, 3, 4, 5]).unwrap();
-        assert_eq!(dev.read_memory(0x4000_0000, 5).unwrap(), vec![1, 2, 3, 4, 5]);
+        assert_eq!(
+            dev.read_memory(0x4000_0000, 5).unwrap(),
+            vec![1, 2, 3, 4, 5]
+        );
         // Untouched regions read back as zeros.
         assert_eq!(dev.read_memory(0x5000_0000, 4).unwrap(), vec![0, 0, 0, 0]);
     }
@@ -1454,10 +1707,7 @@ mod tests {
             pending_read: None,
         });
         dev.fill_memory(0x4000_0000, 10, 0xAB).unwrap();
-        assert_eq!(
-            dev.read_memory(0x4000_0000, 10).unwrap(),
-            vec![0xAB; 10]
-        );
+        assert_eq!(dev.read_memory(0x4000_0000, 10).unwrap(), vec![0xAB; 10]);
         assert!(dev.fill_memory(0x4000_0000, 0, 1).is_err());
         assert!(dev.fill_memory(u32::MAX, 16, 1).is_err());
     }
@@ -1496,6 +1746,170 @@ mod tests {
             err.contains("0x40000000"),
             "mismatch must name the address, got: {}",
             err
+        );
+    }
+
+    #[test]
+    fn partition_upgrade_selects_mode() {
+        let opts = BurnOptions {
+            partition_upgrade: true,
+            ..Default::default()
+        };
+        assert_eq!(upg_mode(&opts), UPG_MODE_PARTITION_UPGRADE);
+        assert_eq!(upg_mode_name(&opts), "partition upgrade mode");
+        assert_eq!(
+            upg_mode(&BurnOptions::default()),
+            UPG_MODE_FULL_DISK_UPGRADE
+        );
+    }
+
+    fn plan_image_parts() -> (Vec<u8>, Vec<FwcMeta>) {
+        let img = vec![0xABu8; 4 * 512];
+        let names = [
+            ("image.updater.ddr", ""),
+            ("image.info", ""),
+            ("image.target.spl", "spl"),
+            ("image.target.os", "os"),
+        ];
+        let metas = names
+            .iter()
+            .enumerate()
+            .map(|(index, (name, partition))| {
+                let offset = (index * 512) as u32;
+                let crc = crc32fast::hash(&img[(index * 512)..(index * 512 + 512)]);
+                make_meta(name, partition, offset, 512, crc)
+            })
+            .collect();
+        (img, metas)
+    }
+
+    #[test]
+    fn plan_selects_only_os() {
+        let (img, metas) = plan_image_parts();
+        let opts = BurnOptions {
+            selected_parts: vec!["os".to_string()],
+            partition_upgrade: true,
+            ..Default::default()
+        };
+        let plan = plan_burn(&img, &metas, &opts).unwrap();
+        assert_eq!(plan.mode, UPG_MODE_PARTITION_UPGRADE);
+        let selected: Vec<&str> = plan
+            .components
+            .iter()
+            .filter(|c| c.selected)
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(
+            selected,
+            vec!["image.updater.ddr", "image.info", "image.target.os"]
+        );
+        assert_eq!(plan.total_bytes, 3 * 512);
+    }
+
+    #[test]
+    fn plan_rejects_unknown_partition() {
+        let (img, metas) = plan_image_parts();
+        let opts = BurnOptions {
+            selected_parts: vec!["boot".to_string()],
+            ..Default::default()
+        };
+        let err = plan_burn(&img, &metas, &opts).unwrap_err();
+        assert!(err.contains("Unknown target partition"), "{}", err);
+    }
+
+    #[test]
+    fn plan_rejects_duplicate_selection() {
+        let (img, metas) = plan_image_parts();
+        let opts = BurnOptions {
+            selected_parts: vec!["os".to_string(), "os".to_string()],
+            ..Default::default()
+        };
+        let err = plan_burn(&img, &metas, &opts).unwrap_err();
+        assert!(err.contains("Duplicate partition"), "{}", err);
+    }
+
+    #[test]
+    fn plan_rejects_empty_selection() {
+        let (img, metas) = plan_image_parts();
+        let opts = BurnOptions {
+            selected_parts: vec![],
+            ..Default::default()
+        };
+        let err = plan_burn(&img, &metas, &opts).unwrap_err();
+        assert!(err.contains("No target partitions selected"), "{}", err);
+    }
+
+    #[test]
+    fn plan_rejects_crc_mismatch() {
+        let (mut img, metas) = plan_image_parts();
+        img[0] ^= 0xFF;
+        let opts = BurnOptions {
+            selected_parts: vec!["os".to_string()],
+            ..Default::default()
+        };
+        let err = plan_burn(&img, &metas, &opts).unwrap_err();
+        assert!(err.contains("CRC mismatch"), "{}", err);
+    }
+
+    #[test]
+    fn partition_burn_sends_only_os_and_partition_mode() {
+        let (img, metas) = plan_image_parts();
+        let opts = BurnOptions {
+            selected_parts: vec!["os".to_string()],
+            partition_upgrade: true,
+            reset_after_burn: false,
+            ..Default::default()
+        };
+        let mut dev = mock_device();
+        let mut started = Vec::new();
+        let mut cb = |event: BurnEvent| {
+            if let BurnEvent::ComponentStarted { name, .. } = event {
+                started.push(name);
+            }
+        };
+        dev.burn_image_with_options(&img, &metas, &opts, Some(&mut cb))
+            .expect("partition burn must succeed");
+        assert_eq!(
+            dev.transport_mut().upg_modes,
+            vec![UPG_MODE_PARTITION_UPGRADE]
+        );
+        assert_eq!(
+            started,
+            vec![
+                "image.updater.ddr".to_string(),
+                "image.info".to_string(),
+                "image.target.os".to_string()
+            ]
+        );
+        assert!(!dev.transport_mut().saw_reset);
+    }
+
+    #[test]
+    fn no_updater_skips_updater_components() {
+        let (img, metas) = plan_image_parts();
+        let opts = BurnOptions {
+            selected_parts: vec!["os".to_string()],
+            partition_upgrade: true,
+            no_updater: true,
+            reset_after_burn: false,
+            ..Default::default()
+        };
+        let mut dev = mock_device();
+        let mut started = Vec::new();
+        let mut cb = |event: BurnEvent| {
+            if let BurnEvent::ComponentStarted { name, .. } = event {
+                started.push(name);
+            }
+        };
+        dev.burn_image_with_options(&img, &metas, &opts, Some(&mut cb))
+            .expect("no-updater burn must succeed");
+        assert_eq!(
+            started,
+            vec!["image.info".to_string(), "image.target.os".to_string()]
+        );
+        assert_eq!(
+            dev.transport_mut().upg_modes,
+            vec![UPG_MODE_PARTITION_UPGRADE]
         );
     }
 }

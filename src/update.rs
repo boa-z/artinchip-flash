@@ -20,6 +20,7 @@ pub enum UpdateChannel {
 }
 
 impl UpdateChannel {
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(value: &str) -> Self {
         if value.eq_ignore_ascii_case("nightly") {
             UpdateChannel::Nightly
@@ -59,10 +60,7 @@ impl UpdateStatus {
                         self.current_version, latest, self.html_url
                     )
                 } else {
-                    format!(
-                        "Up to date: {} (latest {})",
-                        self.current_version, latest
-                    )
+                    format!("Up to date: {} (latest {})", self.current_version, latest)
                 }
             }
             UpdateChannel::Nightly => {
@@ -107,8 +105,8 @@ fn check_stable() -> Result<UpdateStatus, String> {
         .map_err(|e| map_backend_error(e.to_string()))?;
 
     let current = build_info::VERSION.to_string();
-    let current_parsed =
-        semver::Version::parse(current.trim_start_matches('v')).unwrap_or(semver::Version::new(0, 0, 0));
+    let current_parsed = semver::Version::parse(current.trim_start_matches('v'))
+        .unwrap_or(semver::Version::new(0, 0, 0));
 
     // `Releases` skips non-semver tags (e.g. `nightly`) internally; iterate what remains.
     let mut best: Option<(semver::Version, String, String, String)> = None;
@@ -127,10 +125,7 @@ fn check_stable() -> Result<UpdateStatus, String> {
             best = Some((
                 parsed,
                 tag_version,
-                release
-                    .release_notes_url()
-                    .unwrap_or_default()
-                    .to_string(),
+                release.release_notes_url().unwrap_or_default().to_string(),
                 release.body().unwrap_or_default().to_string(),
             ));
         }
@@ -260,7 +255,8 @@ fn first_lines(body: &str, max: usize) -> String {
 }
 
 fn map_backend_error(message: String) -> String {
-    if message.contains("RateLimited") || message.contains("rate limit") || message.contains("403") {
+    if message.contains("RateLimited") || message.contains("rate limit") || message.contains("403")
+    {
         return format!(
             "GitHub API rate limited (60 req/h unauthenticated). Set GH_TOKEN/GITHUB_TOKEN and retry. Detail: {}",
             message

@@ -136,10 +136,7 @@ fn parse(text: &str) -> BurnStats {
         return BurnStats::default();
     };
     // Accept both `{"days": {...}}` (current) and a bare `{date: {...}}` map.
-    let days_value = value
-        .get("days")
-        .cloned()
-        .unwrap_or_else(|| value.clone());
+    let days_value = value.get("days").cloned().unwrap_or_else(|| value.clone());
     let Some(map) = days_value.as_object() else {
         return BurnStats::default();
     };
@@ -153,10 +150,7 @@ fn parse(text: &str) -> BurnStats {
             DayStat {
                 success: entry.get("success").and_then(|v| v.as_u64()).unwrap_or(0),
                 failure: entry.get("failure").and_then(|v| v.as_u64()).unwrap_or(0),
-                cancelled: entry
-                    .get("cancelled")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0),
+                cancelled: entry.get("cancelled").and_then(|v| v.as_u64()).unwrap_or(0),
             },
         );
     }
@@ -276,9 +270,7 @@ mod tests {
 
     #[test]
     fn parse_accepts_wrapped_and_bare_shapes() {
-        let wrapped = parse(
-            r#"{"days": {"2026-10-09": {"success": 2, "failure": 1}}}"#,
-        );
+        let wrapped = parse(r#"{"days": {"2026-10-09": {"success": 2, "failure": 1}}}"#);
         assert_eq!(wrapped.days["2026-10-09"].success, 2);
         assert_eq!(wrapped.days["2026-10-09"].failure, 1);
         assert_eq!(wrapped.days["2026-10-09"].cancelled, 0);

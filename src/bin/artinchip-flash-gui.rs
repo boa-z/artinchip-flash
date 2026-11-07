@@ -20,8 +20,8 @@ use artinchip_flash::official::{self, OfficialArgs, OfficialCommand};
 use artinchip_flash::sdcard;
 use artinchip_flash::services::{self, UartSpec};
 use artinchip_flash::standalone;
-use artinchip_flash::update::{self, UpdateChannel};
 use artinchip_flash::uart::{SerialPortInfo, UartDevice, UartMonitor, UartOptions};
+use artinchip_flash::update::{self, UpdateChannel};
 use artinchip_flash::usb::device::{AicDevice, BurnEvent, BurnOptions, DeviceInfo};
 use artinchip_flash::verbosity;
 use eframe::egui;
@@ -169,7 +169,9 @@ impl GuiApp {
         }
         app.start_device_scan(cc.egui_ctx.clone(), false);
         // Auto update check on startup (24h throttle, non-blocking).
-        if app.config.auto_check_update && !update_recently_checked(app.config.last_update_check_unix) {
+        if app.config.auto_check_update
+            && !update_recently_checked(app.config.last_update_check_unix)
+        {
             app.start_update_check(cc.egui_ctx.clone());
         }
         app
@@ -258,11 +260,8 @@ impl GuiApp {
                         }
                     }
                 } else {
-                    self.update_status = format!(
-                        "{} ({})",
-                        self.t(Msg::UpToDate),
-                        status.current_version
-                    );
+                    self.update_status =
+                        format!("{} ({})", self.t(Msg::UpToDate), status.current_version);
                     self.log(format!(
                         "{}: {}",
                         self.t(Msg::UpToDate),
@@ -655,6 +654,8 @@ impl GuiApp {
                     burn_timeout: timeout,
                     cancel: Some(cancel),
                     force_upgrade,
+                    partition_upgrade: false,
+                    no_updater: false,
                 };
                 let mut callback = |event| {
                     let _ = tx.send(WorkerEvent::Burn(event));
@@ -890,8 +891,7 @@ impl GuiApp {
                             // Freeze the elapsed counter at completion/cancel
                             // so the status line stops ticking on later
                             // repaints; then record the outcome.
-                            self.burn_finished_elapsed =
-                                self.burn_started_at.map(|s| s.elapsed());
+                            self.burn_finished_elapsed = self.burn_started_at.map(|s| s.elapsed());
                             self.burn_started_at = None;
                             self.record_burn_stats();
                         }
@@ -1196,7 +1196,9 @@ impl GuiApp {
                                     dir.display(),
                                     files.len()
                                 )),
-                                Err(e) => self.log(format!("{}: {}", self.t(Msg::ExtractFailed), e)),
+                                Err(e) => {
+                                    self.log(format!("{}: {}", self.t(Msg::ExtractFailed), e))
+                                }
                             }
                         }
                     }
@@ -2058,8 +2060,7 @@ impl GuiApp {
             .show(ui, |ui| {
                 for line in &self.log_lines {
                     ui.add(
-                        egui::Label::new(egui::RichText::new(line).monospace())
-                            .selectable(true),
+                        egui::Label::new(egui::RichText::new(line).monospace()).selectable(true),
                     );
                 }
             });
@@ -2077,10 +2078,12 @@ impl GuiApp {
 
     fn save_log_to_file(&mut self) {
         let default = services::default_log_path(&self.config.app_dir);
-        let dialog = rfd::FileDialog::new()
-            .set_file_name(default.file_name().and_then(|n| n.to_str()).unwrap_or(
-                "artinchip-flash.log",
-            ));
+        let dialog = rfd::FileDialog::new().set_file_name(
+            default
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("artinchip-flash.log"),
+        );
         let dialog = match default.parent() {
             Some(dir) => dialog.set_directory(dir),
             None => dialog,

@@ -69,6 +69,101 @@ pub struct UsbDeviceInfo {
     pub protocol_code: u8,
 }
 
+/// How to pick one ArtInChip device when several are attached.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DeviceSelector {
+    /// Exactly one device must be present.
+    Unique,
+    /// Stable physical USB port path, e.g. `9-2`.
+    PortPath(String),
+    /// Volatile bus:address pair, e.g. `1:45`.
+    BusAddress(u8, u8),
+}
+
+impl DeviceSelector {
+    /// Parse `--device` (`port-path` or `bus:address`); `None` means Unique.
+    pub fn parse(selector: Option<&str>) -> Result<Self, String> {
+        let Some(text) = selector.map(str::trim).filter(|text| !text.is_empty()) else {
+            return Ok(Self::Unique);
+        };
+        if let Some((bus, address)) = text.split_once(':') {
+            let bus = bus
+                .parse::<u8>()
+                .map_err(|_| format!("Invalid bus number in '{}'", text))?;
+            let address = address
+                .parse::<u8>()
+                .map_err(|_| format!("Invalid address in '{}'", text))?;
+            return Ok(Self::BusAddress(bus, address));
+        }
+        Ok(Self::PortPath(text.to_string()))
+    }
+}
+
+/// Pick the single candidate matching `selector`.
+fn select_candidate(
+    selector: &DeviceSelector,
+    candidates: &[(u8, u8, String)],
+) -> Result<(u8, u8), String> {
+    let describe = |candidates: &[(u8, u8, String)]| {
+        candidates
+            .iter()
+            .map(|(bus, address, path)| {
+                format!(
+                    "bus {} address {} path {}",
+                    bus,
+                    address,
+                    if path.is_empty() { "?" } else { path }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+
+    match selector {
+        DeviceSelector::Unique => match candidates {
+            [] => Err("No ArtInChip device found (VID=0x33C3, PID=0x6677)".to_string()),
+            [one] => Ok((one.0, one.1)),
+            many => Err(format!(
+                "Multiple ArtInChip devices found; pass --device <port-path|bus:address>: {}",
+                describe(many)
+            )),
+        },
+        DeviceSelector::PortPath(path) => {
+            let found: Vec<_> = candidates
+                .iter()
+                .filter(|(_, _, candidate_path)| candidate_path == path)
+                .collect();
+            match found.as_slice() {
+                [one] => Ok((one.0, one.1)),
+                [] => Err(format!("No ArtInChip device at port path '{}'", path)),
+                _ => Err(format!(
+                    "Multiple ArtInChip devices at port path '{}'",
+                    path
+                )),
+            }
+        }
+        DeviceSelector::BusAddress(bus, address) => {
+            let found: Vec<_> = candidates
+                .iter()
+                .filter(|(candidate_bus, candidate_address, _)| {
+                    candidate_bus == bus && candidate_address == address
+                })
+                .collect();
+            match found.as_slice() {
+                [one] => Ok((one.0, one.1)),
+                [] => Err(format!(
+                    "No ArtInChip device at bus {} address {}",
+                    bus, address
+                )),
+                _ => Err(format!(
+                    "Multiple ArtInChip devices at bus {} address {}",
+                    bus, address
+                )),
+            }
+        }
+    }
+}
+
 /// USB transport for the ArtInChip UPG protocol (CBW/CSW over bulk endpoints).
 pub struct UsbTransport {
     handle: DeviceHandle<rusb::Context>,
@@ -77,6 +172,9 @@ pub struct UsbTransport {
     in_buf: Vec<u8>,
     bus_number: u8,
     address: u8,
+    /// Stable physical USB port path (e.g. "9-2") used to re-find the
+    /// device after the updater re-enumerates it.
+    port_path: String,
 }
 
 /// Backwards compatible alias: the USB bound device.
@@ -145,171 +243,201 @@ impl UpgDevice<UsbTransport> {
     }
 
     pub fn open_first() -> Result<Self, String> {
-        Self::open_matching(None)
+        Self::open_selector(DeviceSelector::Unique)
     }
 
     pub fn open_by_location(bus_number: u8, address: u8) -> Result<Self, String> {
-        Self::open_matching(Some((bus_number, address)))
+        Self::open_selector(DeviceSelector::BusAddress(bus_number, address))
     }
 
-    fn open_matching(location: Option<(u8, u8)>) -> Result<Self, String> {
-        Self::open_matching_with_recovery(location, false)
+    pub fn open_by_port_path(path: &str) -> Result<Self, String> {
+        Self::open_selector(DeviceSelector::PortPath(path.to_string()))
+    }
+
+    /// Open the requested device; `None` requires exactly one candidate.
+    pub fn open_selected(selector: Option<&str>) -> Result<Self, String> {
+        Self::open_selector(DeviceSelector::parse(selector)?)
+    }
+
+    pub fn open_selector(selector: DeviceSelector) -> Result<Self, String> {
+        Self::open_matching_with_recovery(selector, false)
     }
 
     fn open_matching_with_recovery(
-        location: Option<(u8, u8)>,
+        selector: DeviceSelector,
         recover_endpoints: bool,
     ) -> Result<Self, String> {
         let access_lock = UsbAccessLock::try_acquire()?;
-        Self::open_matching_with_lock(location, recover_endpoints, access_lock)
+        Self::open_matching_with_lock(selector, recover_endpoints, access_lock)
     }
 
     fn open_matching_with_lock(
-        location: Option<(u8, u8)>,
+        selector: DeviceSelector,
         recover_endpoints: bool,
         access_lock: UsbAccessLock,
     ) -> Result<Self, String> {
         let transport =
-            UsbTransport::open_matching_with_lock(location, recover_endpoints, access_lock)?;
+            UsbTransport::open_matching_with_lock(selector, recover_endpoints, access_lock)?;
         Ok(Self::new(transport))
     }
 }
 
 impl UsbTransport {
     fn open_matching_with_lock(
-        location: Option<(u8, u8)>,
+        selector: DeviceSelector,
         recover_endpoints: bool,
         access_lock: UsbAccessLock,
     ) -> Result<Self, String> {
         #[cfg(target_os = "macos")]
-        if let Some(err) = macos_preflight_open_error(location) {
+        if let Some(err) = macos_preflight_open_error(None) {
             return Err(err);
         }
 
         let context = rusb::Context::new().map_err(|e| format!("Failed to init USB: {}", e))?;
-
         let devices = context
             .devices()
             .map_err(|e| format!("Failed to list USB devices: {}", e))?;
 
-        let mut matched_count = 0usize;
-        let mut last_open_error = None;
-
+        let mut candidates: Vec<(u8, u8, String)> = Vec::new();
         for device in devices.iter() {
             let desc = device
                 .device_descriptor()
                 .map_err(|e| format!("Failed to get device descriptor: {}", e))?;
             if desc.vendor_id() == AIC_VID && desc.product_id() == AIC_PID {
-                if let Some((bus, address)) = location {
-                    if device.bus_number() != bus || device.address() != address {
-                        continue;
-                    }
-                }
-                matched_count += 1;
-                #[cfg(target_os = "macos")]
-                if let Err(e) = macos_check_device_ready(device.address()) {
-                    let err = format!(
-                        "Found ArtInChip device at bus {} address {}, but macOS has not configured it for USB transfers: {}",
-                        device.bus_number(),
-                        device.address(),
-                        e
-                    );
-                    if location.is_some() {
-                        return Err(err);
-                    }
-                    last_open_error = Some(err);
-                    continue;
-                }
-                let handle = match device.open() {
-                    Ok(handle) => handle,
-                    Err(e) => {
-                        let err = format!(
-                            "Found ArtInChip device at bus {} address {}, but failed to open it: {}",
-                            device.bus_number(),
-                            device.address(),
-                            format_usb_open_error(e, device.address())
-                        );
-                        if location.is_some() {
-                            return Err(err);
-                        }
-                        last_open_error = Some(err);
-                        continue;
-                    }
-                };
-                if let Ok(active) = handle.kernel_driver_active(0) {
-                    if active {
-                        let _ = handle.detach_kernel_driver(0);
-                    }
-                }
-                if let Ok(desc) = device.config_descriptor(0) {
-                    for iface in desc.interfaces() {
-                        for desc in iface.descriptors() {
-                            log_verbose!(
-                                "  Interface {}: {} endpoints",
-                                desc.interface_number(),
-                                desc.num_endpoints()
-                            );
-                            for ep in desc.endpoint_descriptors() {
-                                log_verbose!(
-                                    "    EP 0x{:02x} {} max_packet={}",
-                                    ep.address(),
-                                    if ep.direction() == rusb::Direction::In {
-                                        "IN"
-                                    } else {
-                                        "OUT"
-                                    },
-                                    ep.max_packet_size()
-                                );
-                            }
-                        }
-                    }
-                }
-
-                handle
-                    .claim_interface(0)
-                    .map_err(|e| format!("Failed to claim interface: {}", e))?;
-
-                let mut transport = Self {
-                    handle,
-                    _access_lock: access_lock,
-                    tag: 1,
-                    in_buf: Vec::new(),
-                    bus_number: device.bus_number(),
-                    address: device.address(),
-                };
-                if recover_endpoints {
-                    let _ = transport.handle.clear_halt(BULK_OUT_EP);
-                    let _ = transport.handle.clear_halt(BULK_IN_EP);
-                    log_verbose!(
-                        "  Cleared halt on EP 0x{:02x} and 0x{:02x}",
-                        BULK_OUT_EP, BULK_IN_EP
-                    );
-                    transport.drain_in_endpoint(Duration::from_millis(50), 64 * 1024)?;
-                }
-                return Ok(transport);
+                let port_path = device
+                    .port_numbers()
+                    .map(|ports| {
+                        ports
+                            .iter()
+                            .map(u8::to_string)
+                            .collect::<Vec<_>>()
+                            .join("-")
+                    })
+                    .unwrap_or_default();
+                candidates.push((device.bus_number(), device.address(), port_path));
             }
         }
-        if let Some(err) = last_open_error {
-            if matched_count > 1 {
+        let wanted = select_candidate(&selector, &candidates)?;
+        log_verbose!(
+            "Selected ArtInChip device at bus {} address {} ({} candidate(s))",
+            wanted.0,
+            wanted.1,
+            candidates.len()
+        );
+
+        for device in devices.iter() {
+            let desc = device
+                .device_descriptor()
+                .map_err(|e| format!("Failed to get device descriptor: {}", e))?;
+            if desc.vendor_id() != AIC_VID || desc.product_id() != AIC_PID {
+                continue;
+            }
+            if (device.bus_number(), device.address()) != wanted {
+                continue;
+            }
+            #[cfg(target_os = "macos")]
+            if let Err(e) = macos_check_device_ready(device.address()) {
                 return Err(format!(
-                    "{} ({} matching devices were detected)",
-                    err, matched_count
+                    "Found ArtInChip device at bus {} address {}, but macOS has not configured it for USB transfers: {}",
+                    device.bus_number(),
+                    device.address(),
+                    e
                 ));
             }
-            return Err(err);
+            let handle = device.open().map_err(|e| {
+                format!(
+                    "Found ArtInChip device at bus {} address {}, but failed to open it: {}",
+                    device.bus_number(),
+                    device.address(),
+                    format_usb_open_error(e, device.address())
+                )
+            })?;
+            if let Ok(active) = handle.kernel_driver_active(0) {
+                if active {
+                    let _ = handle.detach_kernel_driver(0);
+                }
+            }
+            if let Ok(desc) = device.config_descriptor(0) {
+                for iface in desc.interfaces() {
+                    for desc in iface.descriptors() {
+                        log_verbose!(
+                            "  Interface {}: {} endpoints",
+                            desc.interface_number(),
+                            desc.num_endpoints()
+                        );
+                        for ep in desc.endpoint_descriptors() {
+                            log_verbose!(
+                                "    EP 0x{:02x} {} max_packet={}",
+                                ep.address(),
+                                if ep.direction() == rusb::Direction::In {
+                                    "IN"
+                                } else {
+                                    "OUT"
+                                },
+                                ep.max_packet_size()
+                            );
+                        }
+                    }
+                }
+            }
+
+            handle
+                .claim_interface(0)
+                .map_err(|e| format!("Failed to claim interface: {}", e))?;
+
+            let port_path = device
+                .port_numbers()
+                .map(|ports| {
+                    ports
+                        .iter()
+                        .map(u8::to_string)
+                        .collect::<Vec<_>>()
+                        .join("-")
+                })
+                .unwrap_or_default();
+            let mut transport = Self {
+                handle,
+                _access_lock: access_lock,
+                tag: 1,
+                in_buf: Vec::new(),
+                bus_number: device.bus_number(),
+                address: device.address(),
+                port_path,
+            };
+            if recover_endpoints {
+                let _ = transport.handle.clear_halt(BULK_OUT_EP);
+                let _ = transport.handle.clear_halt(BULK_IN_EP);
+                log_verbose!(
+                    "  Cleared halt on EP 0x{:02x} and 0x{:02x}",
+                    BULK_OUT_EP,
+                    BULK_IN_EP
+                );
+                transport.drain_in_endpoint(Duration::from_millis(50), 64 * 1024)?;
+            }
+            return Ok(transport);
         }
-        match location {
-            Some((bus, address)) => Err(format!(
-                "No ArtInChip device found at bus {} address {} (VID=0x33C3, PID=0x6677)",
-                bus, address
-            )),
-            None => Err("No ArtInChip device found (VID=0x33C3, PID=0x6677)".to_string()),
-        }
+        Err(format!(
+            "ArtInChip device disappeared before it could be opened (bus {} address {})",
+            wanted.0, wanted.1
+        ))
     }
 
     fn reopen(&mut self) -> Result<(), String> {
+        // Re-select by the stable physical port path.  Never fall back to
+        // "first device": that could silently burn a different board.
+        let selector = if self.port_path.is_empty() {
+            DeviceSelector::BusAddress(self.bus_number, self.address)
+        } else {
+            DeviceSelector::PortPath(self.port_path.clone())
+        };
         let replacement =
-            UsbTransport::open_matching_with_lock(None, false, self._access_lock.clone())?;
+            UsbTransport::open_matching_with_lock(selector, false, self._access_lock.clone())?;
+        if !self.port_path.is_empty() && replacement.port_path != self.port_path {
+            return Err(format!(
+                "Device reconnected on a different port path: {} -> {}",
+                self.port_path, replacement.port_path
+            ));
+        }
         *self = replacement;
         Ok(())
     }
@@ -362,7 +490,8 @@ impl UsbTransport {
                     Ok(()) => {
                         log_verbose!(
                             "Device reconnected at {}:{}.",
-                            self.bus_number, self.address
+                            self.bus_number,
+                            self.address
                         );
                         thread::sleep(RECONNECT_SETTLE_DELAY);
                         return Ok(());
@@ -507,7 +636,8 @@ impl UsbTransport {
                     attempts += 1;
                     log_verbose!(
                         "  >> DATA start retry #{} after endpoint settle: {}",
-                        attempts, e
+                        attempts,
+                        e
                     );
                     thread::sleep(START_WRITE_RETRY_DELAY);
                 }
@@ -601,7 +731,10 @@ impl UsbTransport {
                 if self.in_buf.len() < 13 {
                     if let Err(e) = self.fill_until(deadline, 13) {
                         if policy == CswPolicy::AllowMissing {
-                            log_verbose!("  << Incomplete CSW accepted by transaction policy: {}", e);
+                            log_verbose!(
+                                "  << Incomplete CSW accepted by transaction policy: {}",
+                                e
+                            );
                             self.in_buf.clear();
                             return Ok(None);
                         }
@@ -1123,11 +1256,64 @@ mod tests {
     fn timeout_override_parses_and_floors() {
         assert_eq!(parse_timeout_ms(None), TIMEOUT_MS);
         assert_eq!(parse_timeout_ms(Some("5000")), Duration::from_millis(5000));
-        assert_eq!(parse_timeout_ms(Some(" 2000 ")), Duration::from_millis(2000));
+        assert_eq!(
+            parse_timeout_ms(Some(" 2000 ")),
+            Duration::from_millis(2000)
+        );
         // Floor, garbage and empty fall back (never fail the transfer path).
         assert_eq!(parse_timeout_ms(Some("0")), Duration::from_millis(500));
         assert_eq!(parse_timeout_ms(Some("100")), Duration::from_millis(500));
         assert_eq!(parse_timeout_ms(Some("nope")), TIMEOUT_MS);
         assert_eq!(parse_timeout_ms(Some("")), TIMEOUT_MS);
+    }
+
+    #[test]
+    fn selector_parses_port_path_and_bus_address() {
+        assert_eq!(DeviceSelector::parse(None).unwrap(), DeviceSelector::Unique);
+        assert_eq!(
+            DeviceSelector::parse(Some("  ")).unwrap(),
+            DeviceSelector::Unique
+        );
+        assert_eq!(
+            DeviceSelector::parse(Some("9-2")).unwrap(),
+            DeviceSelector::PortPath("9-2".to_string())
+        );
+        assert_eq!(
+            DeviceSelector::parse(Some("1:45")).unwrap(),
+            DeviceSelector::BusAddress(1, 45)
+        );
+        assert!(DeviceSelector::parse(Some("1:999")).is_err());
+        assert!(DeviceSelector::parse(Some("x:y")).is_err());
+    }
+
+    #[test]
+    fn unique_selector_rejects_multiple_candidates() {
+        let candidates = vec![(1, 10, "9-2".to_string()), (1, 11, "9-3".to_string())];
+        let err = select_candidate(&DeviceSelector::Unique, &candidates).unwrap_err();
+        assert!(err.contains("Multiple ArtInChip devices"), "{}", err);
+        assert!(err.contains("9-2"), "{}", err);
+
+        let one = vec![(1, 10, "9-2".to_string())];
+        assert_eq!(
+            select_candidate(&DeviceSelector::Unique, &one).unwrap(),
+            (1, 10)
+        );
+    }
+
+    #[test]
+    fn selector_picks_port_path_and_rejects_missing() {
+        let candidates = vec![(1, 10, "9-2".to_string()), (1, 11, "9-3".to_string())];
+        assert_eq!(
+            select_candidate(&DeviceSelector::PortPath("9-3".to_string()), &candidates).unwrap(),
+            (1, 11)
+        );
+        assert!(
+            select_candidate(&DeviceSelector::PortPath("9-9".to_string()), &candidates).is_err()
+        );
+        assert_eq!(
+            select_candidate(&DeviceSelector::BusAddress(1, 10), &candidates).unwrap(),
+            (1, 10)
+        );
+        assert!(select_candidate(&DeviceSelector::BusAddress(1, 99), &candidates).is_err());
     }
 }

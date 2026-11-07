@@ -499,7 +499,8 @@ impl UartTransport {
             if blk != 255 - header[1] {
                 log_verbose!(
                     "  << UART: bad block complement (blk={}, inv={})",
-                    blk, header[1]
+                    blk,
+                    header[1]
                 );
                 let _ = self.write_raw(&[NAK]);
                 continue;
@@ -526,7 +527,8 @@ impl UartTransport {
             if crc_actual != crc_expected {
                 log_verbose!(
                     "  << UART: CRC16 mismatch (0x{:04x} != 0x{:04x}), requesting retransmit",
-                    crc_actual, crc_expected
+                    crc_actual,
+                    crc_expected
                 );
                 let _ = self.write_raw(&[NAK]);
                 continue;
@@ -710,7 +712,8 @@ impl UpgDevice<UartTransport> {
         let mut device = Self::new(transport);
         log_verbose!(
             "Connecting to ArtInChip UART device on '{}' at {} bps ...",
-            path, options.baudrate
+            path,
+            options.baudrate
         );
         let probe_timeout = if options.auto_enter {
             Duration::from_millis(1500)

@@ -59,6 +59,25 @@ enum Commands {
         /// Requires the device-side force-upgrade switch; unverified hardware.
         #[arg(long)]
         force_upgrade: bool,
+        /// Target partitions (repeatable or comma-separated).  Selects
+        /// partition-upgrade mode and only sends those image.target.*
+        /// components; without it the legacy spl,env,os set is used.
+        #[arg(
+            long,
+            value_name = "PART",
+            value_delimiter = ',',
+            action = clap::ArgAction::Append
+        )]
+        partition: Vec<String>,
+        /// Print the validated burn plan and exit without touching a device
+        #[arg(long)]
+        plan: bool,
+        /// USB device selector: physical port path (9-2) or bus:address (1:45)
+        #[arg(long, value_name = "SELECTOR")]
+        device: Option<String>,
+        /// Skip updater components (device already in bootloader upgrade mode)
+        #[arg(long)]
+        no_updater: bool,
         /// Erase the whole chip via `upgcmd flasherase` before burning.
         /// Needs --upgcmd-path (or the Windows default AiBurn install).
         #[arg(long)]
@@ -329,6 +348,10 @@ fn main() {
             image,
             no_reset,
             force_upgrade,
+            partition,
+            plan,
+            device,
+            no_updater,
             erase_all,
             erase_media,
             upgcmd_path,
@@ -341,6 +364,10 @@ fn main() {
             image,
             no_reset,
             force_upgrade,
+            partition,
+            plan,
+            device,
+            no_updater,
             erase_all,
             erase_media,
             upgcmd_path,
@@ -358,25 +385,48 @@ fn main() {
         } => cmd_uart_monitor(port, baud, enter_upg),
         Commands::EnvCheck { image } => cmd_env_check(image),
         Commands::InstallUsbAccess => cmd_install_usb_access(),
-        Commands::Write { address, input, skip, length, transport } => {
-            cmd_write(address, input, skip, length, transport)
-        }
-        Commands::Read { address, length, output, transport } => {
-            cmd_read(address, length, output, transport)
-        }
-        Commands::Writel { address, value, transport } => cmd_writel(address, value, transport),
+        Commands::Write {
+            address,
+            input,
+            skip,
+            length,
+            transport,
+        } => cmd_write(address, input, skip, length, transport),
+        Commands::Read {
+            address,
+            length,
+            output,
+            transport,
+        } => cmd_read(address, length, output, transport),
+        Commands::Writel {
+            address,
+            value,
+            transport,
+        } => cmd_writel(address, value, transport),
         Commands::Readl { address, transport } => cmd_readl(address, transport),
         Commands::Exec { address, transport } => cmd_exec(address, transport),
-        Commands::Hexdump { address, length, transport } => {
-            cmd_hexdump(address, length, transport)
-        }
-        Commands::Fill { address, length, value, transport } => {
-            cmd_fill(address, length, value, transport)
-        }
-        Commands::Clear { address, length, transport } => cmd_clear(address, length, transport),
-        Commands::Memtest { address, size, rounds, transport } => {
-            cmd_memtest(address, size, rounds, transport)
-        }
+        Commands::Hexdump {
+            address,
+            length,
+            transport,
+        } => cmd_hexdump(address, length, transport),
+        Commands::Fill {
+            address,
+            length,
+            value,
+            transport,
+        } => cmd_fill(address, length, value, transport),
+        Commands::Clear {
+            address,
+            length,
+            transport,
+        } => cmd_clear(address, length, transport),
+        Commands::Memtest {
+            address,
+            size,
+            rounds,
+            transport,
+        } => cmd_memtest(address, size, rounds, transport),
         Commands::Shcmd { shell, transport } => cmd_shcmd(shell, transport),
         Commands::Log { transport } => cmd_log(transport),
         Commands::Stats { clear } => cmd_stats(clear, cli.json),
@@ -385,7 +435,12 @@ fn main() {
     }
 }
 
-fn open_uart_shared(port: &str, baud: u32, speed: Option<u32>, auto_enter: bool) -> Result<artinchip_flash::uart::UartDevice, String> {
+fn open_uart_shared(
+    port: &str,
+    baud: u32,
+    speed: Option<u32>,
+    auto_enter: bool,
+) -> Result<artinchip_flash::uart::UartDevice, String> {
     services::open_uart(&UartSpec::new(port, baud, speed, auto_enter))
 }
 
@@ -396,9 +451,7 @@ fn open_uart_shared(port: &str, baud: u32, speed: Option<u32>, auto_enter: bool)
 fn default_upgcmd_path() -> PathBuf {
     #[cfg(windows)]
     {
-        artinchip_flash::app_config::compat_tool_path(std::path::Path::new(
-            r"C:\ArtInChip\AiBurn",
-        ))
+        artinchip_flash::app_config::compat_tool_path(std::path::Path::new(r"C:\ArtInChip\AiBurn"))
     }
     #[cfg(not(windows))]
     {
@@ -628,6 +681,10 @@ struct BurnFlags {
     image: PathBuf,
     no_reset: bool,
     force_upgrade: bool,
+    partition: Vec<String>,
+    plan: bool,
+    device: Option<String>,
+    no_updater: bool,
     erase_all: bool,
     erase_media: Option<String>,
     upgcmd_path: Option<PathBuf>,
@@ -644,6 +701,10 @@ fn cmd_burn(flags: BurnFlags) {
         image: image_path,
         no_reset,
         force_upgrade,
+        partition,
+        plan,
+        device,
+        no_updater,
         erase_all,
         erase_media,
         upgcmd_path,
@@ -681,6 +742,67 @@ fn cmd_burn(flags: BurnFlags) {
         img_data.len()
     );
 
+    if !partition.is_empty() && (erase_all || force_upgrade) {
+        eprintln!(
+            "Error: --partition (OS-only) cannot be combined with --erase-all or --force-upgrade"
+        );
+        std::process::exit(2);
+    }
+
+    let selected_parts = if partition.is_empty() {
+        BurnOptions::default().selected_parts
+    } else {
+        partition.clone()
+    };
+    let plan_options = BurnOptions {
+        selected_parts,
+        partition_upgrade: !partition.is_empty(),
+        no_updater,
+        force_upgrade,
+        reset_after_burn: !no_reset && !force_upgrade,
+        ..Default::default()
+    };
+    let burn_plan = match artinchip_flash::device::plan_burn(&img_data, &metas, &plan_options) {
+        Ok(plan) => plan,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(2);
+        }
+    };
+    if plan {
+        if json {
+            let components: Vec<_> = burn_plan
+                .components
+                .iter()
+                .map(|component| {
+                    serde_json::json!({
+                        "kind": component.kind,
+                        "name": component.name,
+                        "partition": component.partition,
+                        "media": component.media,
+                        "size": component.size,
+                        "crc": format!("{:08x}", component.crc),
+                        "selected": component.selected,
+                    })
+                })
+                .collect();
+            println!(
+                "{}",
+                serde_json::json!({
+                    "mode": burn_plan.mode,
+                    "mode_name": artinchip_flash::device::upg_mode_name(&plan_options),
+                    "total_bytes": burn_plan.total_bytes,
+                    "components": components,
+                })
+            );
+        } else {
+            for line in artinchip_flash::device::format_plan_lines(&burn_plan) {
+                println!("{}", line);
+            }
+        }
+        return;
+    }
+
     if force_upgrade {
         eprintln!(
             "Note: --force-upgrade is experimental (BURN_IMG_FORCE, no post-burn reset); \
@@ -706,10 +828,14 @@ fn cmd_burn(flags: BurnFlags) {
             std::process::exit(1);
         }
         let (erase_uart, erase_baud) = match (&uart, speed) {
-            (Some(port), _) if !port.eq_ignore_ascii_case("auto") => {
-                (port.clone(), speed.map(|b| b.to_string()).unwrap_or_default())
-            }
-            (Some(_), _) => (String::new(), speed.map(|b| b.to_string()).unwrap_or_default()),
+            (Some(port), _) if !port.eq_ignore_ascii_case("auto") => (
+                port.clone(),
+                speed.map(|b| b.to_string()).unwrap_or_default(),
+            ),
+            (Some(_), _) => (
+                String::new(),
+                speed.map(|b| b.to_string()).unwrap_or_default(),
+            ),
             (None, _) => (String::new(), String::new()),
         };
         eprintln!("Erasing chip (flasherase media {}) ...", media);
@@ -742,10 +868,8 @@ fn cmd_burn(flags: BurnFlags) {
         });
     }
     let options = BurnOptions {
-        reset_after_burn: !no_reset && !force_upgrade,
-        force_upgrade,
         cancel: Some(cancel),
-        ..Default::default()
+        ..plan_options
     };
 
     eprintln!("Press Ctrl+C to cancel the burn (aborts at the next chunk).");
@@ -764,7 +888,7 @@ fn cmd_burn(flags: BurnFlags) {
             )
         })
     } else {
-        usb::device::AicDevice::open_first().and_then(|dev| {
+        usb::device::AicDevice::open_selected(device.as_deref()).and_then(|dev| {
             burn_with_device(
                 dev,
                 &img_data,
@@ -804,7 +928,7 @@ fn cmd_burn(flags: BurnFlags) {
             std::process::exit(130);
         }
         eprintln!("Burn failed after {:.1}s: {}", elapsed.as_secs_f64(), e);
-        std::process::exit(1);
+        std::process::exit(burn_error_exit_code(&e));
     }
 
     if let Err(e) = burn_stats::record(&standalone::default_app_dir(), BurnOutcome::Success) {
@@ -817,6 +941,28 @@ fn cmd_burn(flags: BurnFlags) {
         format_rate(img_data.len() as f64 / elapsed.as_secs_f64().max(0.001))
     );
     println!("Burn completed successfully!");
+}
+
+fn burn_error_exit_code(err: &str) -> i32 {
+    if err.contains("cancelled") {
+        130
+    } else if err.contains("Multiple ArtInChip")
+        || err.contains("No ArtInChip device")
+        || err.contains("disappeared")
+        || err.contains("No device")
+    {
+        3
+    } else if err.contains("Unknown target partition")
+        || err.contains("Duplicate partition")
+        || err.contains("No target")
+        || err.contains("CRC mismatch")
+        || err.contains("image.info")
+        || err.contains("META")
+    {
+        2
+    } else {
+        4
+    }
 }
 
 fn burn_with_device<T: UpgTransport>(
@@ -848,7 +994,11 @@ fn burn_with_device<T: UpgTransport>(
         } else {
             let line = match event {
                 BurnEvent::Log(line) | BurnEvent::Stage(line) => line,
-                BurnEvent::ComponentStarted { name, partition, size } => {
+                BurnEvent::ComponentStarted {
+                    name,
+                    partition,
+                    size,
+                } => {
                     format!("Meta {} partition={} size={} ...", name, partition, size)
                 }
                 BurnEvent::ComponentProgress { name, sent, total } => {
@@ -900,7 +1050,11 @@ fn format_rate(bps: f64) -> String {
 }
 
 fn format_elapsed(elapsed: std::time::Duration) -> String {
-    format!("[{:02}:{:02}]", elapsed.as_secs() / 60, elapsed.as_secs() % 60)
+    format!(
+        "[{:02}:{:02}]",
+        elapsed.as_secs() / 60,
+        elapsed.as_secs() % 60
+    )
 }
 
 #[allow(dead_code)]
@@ -911,9 +1065,17 @@ fn burn_event_json(event: &BurnEvent) -> serde_json::Value {
 fn burn_event_json_timed(event: &BurnEvent, elapsed: std::time::Duration) -> serde_json::Value {
     let elapsed_secs = elapsed.as_secs_f64();
     match event {
-        BurnEvent::Log(line) => serde_json::json!({ "type": "log", "line": line, "elapsed_secs": elapsed_secs }),
-        BurnEvent::Stage(line) => serde_json::json!({ "type": "stage", "line": line, "elapsed_secs": elapsed_secs }),
-        BurnEvent::ComponentStarted { name, partition, size } => {
+        BurnEvent::Log(line) => {
+            serde_json::json!({ "type": "log", "line": line, "elapsed_secs": elapsed_secs })
+        }
+        BurnEvent::Stage(line) => {
+            serde_json::json!({ "type": "stage", "line": line, "elapsed_secs": elapsed_secs })
+        }
+        BurnEvent::ComponentStarted {
+            name,
+            partition,
+            size,
+        } => {
             serde_json::json!({ "type": "component_started", "name": name, "partition": partition, "size": size, "elapsed_secs": elapsed_secs })
         }
         BurnEvent::ComponentProgress { name, sent, total } => {
@@ -925,7 +1087,9 @@ fn burn_event_json_timed(event: &BurnEvent, elapsed: std::time::Duration) -> ser
         BurnEvent::ComponentFinished { name } => {
             serde_json::json!({ "type": "component_finished", "name": name, "elapsed_secs": elapsed_secs })
         }
-        BurnEvent::Finished => serde_json::json!({ "type": "finished", "elapsed_secs": elapsed_secs }),
+        BurnEvent::Finished => {
+            serde_json::json!({ "type": "finished", "elapsed_secs": elapsed_secs })
+        }
     }
 }
 
@@ -969,7 +1133,10 @@ fn cmd_write(
     transport: TransportArgs,
 ) {
     let addr = must_parse_u32("address", &address);
-    let skip_bytes = skip.as_deref().map(|s| must_parse_u32("skip", s)).unwrap_or(0) as usize;
+    let skip_bytes = skip
+        .as_deref()
+        .map(|s| must_parse_u32("skip", s))
+        .unwrap_or(0) as usize;
     let file = match fs::read(&input) {
         Ok(data) => data,
         Err(e) => {
@@ -978,11 +1145,7 @@ fn cmd_write(
         }
     };
     if skip_bytes > file.len() {
-        eprintln!(
-            "Skip {} exceeds input size {}",
-            skip_bytes,
-            file.len()
-        );
+        eprintln!("Skip {} exceeds input size {}", skip_bytes, file.len());
         std::process::exit(1);
     }
     let mut data = &file[skip_bytes..];
@@ -1196,7 +1359,9 @@ fn cmd_sd_list(json: bool) {
             for disk in &disks {
                 println!("{}", disk.summary());
             }
-            println!("Note: use official AiBurn to write a boot card; double-check the target id first.");
+            println!(
+                "Note: use official AiBurn to write a boot card; double-check the target id first."
+            );
         }
         Err(e) => {
             eprintln!("Failed to list physical disks: {}", e);
@@ -1214,7 +1379,10 @@ fn cmd_update(channel: &str, open: bool, json: bool) {
             } else {
                 println!("{}", status.summary_line());
                 println!("Channel: {}", status.channel.as_str());
-                println!("Current: {} ({})", status.current_version, status.current_commit);
+                println!(
+                    "Current: {} ({})",
+                    status.current_version, status.current_commit
+                );
                 println!("Latest:  {}", status.latest_tag);
                 println!("Page:    {}", status.html_url);
                 if !status.notes_preview.is_empty() {

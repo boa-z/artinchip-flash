@@ -194,7 +194,10 @@ pub fn parse_windows_get_disk_csv(text: &str) -> Vec<PhysicalDisk> {
             .trim_matches('"')
             .parse::<u64>()
             .unwrap_or(0);
-        let bus_type = fields.get(3).map(|s| s.trim().trim_matches('"').to_string()).unwrap_or_default();
+        let bus_type = fields
+            .get(3)
+            .map(|s| s.trim().trim_matches('"').to_string())
+            .unwrap_or_default();
         out.push(PhysicalDisk {
             id: format!("PhysicalDrive{}", number),
             model,

@@ -84,8 +84,7 @@ pub fn parse_u32(text: &str) -> Result<u32, String> {
         if hex.is_empty() {
             return Err(format!("invalid hex value '{}'", text));
         }
-        return u32::from_str_radix(hex, 16)
-            .map_err(|_| format!("invalid hex value '{}'", text));
+        return u32::from_str_radix(hex, 16).map_err(|_| format!("invalid hex value '{}'", text));
     }
     let (digits, mult) = if let Some(base) = trimmed
         .strip_suffix('k')
@@ -106,9 +105,9 @@ pub fn parse_u32(text: &str) -> Result<u32, String> {
     let value = digits
         .parse::<u32>()
         .map_err(|_| format!("invalid numeric value '{}'", text))?;
-    value.checked_mul(mult).ok_or_else(|| {
-        format!("numeric value '{}' overflows u32 after suffix", text)
-    })
+    value
+        .checked_mul(mult)
+        .ok_or_else(|| format!("numeric value '{}' overflows u32 after suffix", text))
 }
 
 /// Classic 16-bytes-per-row hexdump (`addr: hex...  |ascii|`).
@@ -177,9 +176,7 @@ pub fn load_image_for_burn(
 /// Mirrors the historical `image.target.<name>` stripping so both frontends
 /// stay consistent.
 pub fn partition_key(meta_name: &str) -> &str {
-    meta_name
-        .strip_prefix("image.target.")
-        .unwrap_or(meta_name)
+    meta_name.strip_prefix("image.target.").unwrap_or(meta_name)
 }
 
 /// Returns true when `meta_name` is a user-selectable burn target.
@@ -231,10 +228,9 @@ pub fn default_log_path(base_dir: &Path) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    base_dir.join("logs").join(format!(
-        "artinchip-flash-{}.log",
-        log_file_stamp(secs)
-    ))
+    base_dir
+        .join("logs")
+        .join(format!("artinchip-flash-{}.log", log_file_stamp(secs)))
 }
 
 /// Write log lines to `path` (creating parent directories), shared by the CLI
@@ -248,8 +244,7 @@ pub fn write_log_file(path: &Path, lines: &[String]) -> Result<(), String> {
     }
     let mut text = lines.join("\n");
     text.push('\n');
-    std::fs::write(path, text)
-        .map_err(|e| format!("Failed to write '{}': {}", path.display(), e))
+    std::fs::write(path, text).map_err(|e| format!("Failed to write '{}': {}", path.display(), e))
 }
 
 #[cfg(test)]

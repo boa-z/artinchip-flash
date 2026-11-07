@@ -156,7 +156,9 @@ impl FwcMeta {
 /// NUL-padded C string slice: invalid UTF-8 yields `""` rather than failing
 /// the whole entry (middle struct bytes may be non-text).
 fn cstr(bytes: &[u8]) -> &str {
-    std::str::from_utf8(bytes).unwrap_or("").trim_end_matches('\0')
+    std::str::from_utf8(bytes)
+        .unwrap_or("")
+        .trim_end_matches('\0')
 }
 
 /// Write `bytes` as a NUL-padded C string field of exactly `len` bytes.
@@ -206,7 +208,9 @@ impl StorageMedia {
     /// A trailing partial chunk is dropped.
     pub fn parse_list(payload: &[u8]) -> Vec<StorageMedia> {
         payload
-            .chunks_exact(STORAGE_MEDIA_SIZE)
+            .as_chunks::<STORAGE_MEDIA_SIZE>()
+            .0
+            .iter()
             .map(|chunk| StorageMedia {
                 media_type: cstr(&chunk[..64]).to_string(),
                 media_dev_id: u32::from_le_bytes(chunk[64..68].try_into().unwrap()),
