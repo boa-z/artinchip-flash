@@ -101,6 +101,10 @@ impl FwcMeta {
         cstr(&self.bytes[112..136])
     }
 
+    pub(crate) fn uses_image_media(&self) -> bool {
+        self.bytes[106..136].iter().all(|&byte| byte == 0)
+    }
+
     /// Partition start in 64 KiB units (u32 LE at `[34..38)`).
     pub fn partition_start_64k(&self) -> u32 {
         u32::from_le_bytes(self.bytes[106..110].try_into().unwrap())

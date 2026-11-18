@@ -403,25 +403,20 @@ impl GuiApp {
         let Some(summary) = &self.image_summary else {
             return;
         };
-        if self.selected_parts.is_empty() {
-            self.selected_parts = self.config.selected_parts.clone();
-        }
-        for meta in target_metas(summary) {
-            let key = part_key(meta);
-            if self
-                .config
-                .selected_parts
-                .iter()
-                .any(|p| p == &key || p == &meta.partition)
-            {
-                continue;
-            }
-        }
-        if self.selected_parts.is_empty() {
+        if self.config.selected_parts == BurnOptions::default().selected_parts {
             self.selected_parts = target_metas(summary)
+                .filter(|meta| {
+                    artinchip_flash::device::default_burn_target(&meta.name, &meta.partition_media)
+                })
                 .map(part_key)
-                .filter(|key| ["spl", "env", "os"].contains(&key.as_str()))
                 .collect();
+        } else {
+            self.selected_parts = self.config.selected_parts.clone();
+            self.selected_parts.retain(|part| {
+                target_metas(summary).any(|meta| {
+                    part == &part_key(meta) || part == &meta.partition || part == &meta.name
+                })
+            });
         }
     }
 
@@ -594,6 +589,24 @@ impl GuiApp {
 
         thread::spawn(move || {
             let result = (|| -> Result<(), String> {
+                let (data, header, metas, _summary) = parser::read_image(&path)?;
+                let options = BurnOptions {
+                    selected_parts,
+                    reset_after_burn,
+                    burn_timeout: timeout,
+                    cancel: Some(cancel),
+                    force_upgrade,
+                    partition_upgrade: false,
+                    no_updater: false,
+                };
+                let plan = artinchip_flash::device::plan_burn(&data, &metas, &options)?;
+                if erase_all
+                    && plan.mode == artinchip_flash::protocol::commands::UPG_MODE_PARTITION_UPGRADE
+                {
+                    return Err(
+                        "Partition selection cannot be combined with full-chip erase".to_string(),
+                    );
+                }
                 if adb_scan {
                     let _ = tx.send(WorkerEvent::ToolOutput(
                         tr(lang, Msg::StartAdbScan).to_string(),
@@ -613,7 +626,6 @@ impl GuiApp {
                     }
                     thread::sleep(Duration::from_millis(700));
                 }
-                let (data, header, metas, _summary) = parser::read_image(&path)?;
                 if force_upgrade {
                     let _ = tx.send(WorkerEvent::ToolOutput(
                         tr(lang, Msg::ForceUpgradeNote).to_string(),
@@ -648,15 +660,6 @@ impl GuiApp {
                         }
                     }
                 }
-                let options = BurnOptions {
-                    selected_parts,
-                    reset_after_burn,
-                    burn_timeout: timeout,
-                    cancel: Some(cancel),
-                    force_upgrade,
-                    partition_upgrade: false,
-                    no_updater: false,
-                };
                 let mut callback = |event| {
                     let _ = tx.send(WorkerEvent::Burn(event));
                 };

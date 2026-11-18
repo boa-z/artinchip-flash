@@ -61,7 +61,7 @@ enum Commands {
         force_upgrade: bool,
         /// Target partitions (repeatable or comma-separated).  Selects
         /// partition-upgrade mode and only sends those image.target.*
-        /// components; without it the legacy spl,env,os set is used.
+        /// components; defaults to spl,env,os for RT-Thread and all targets for Linux.
         #[arg(
             long,
             value_name = "PART",
@@ -743,14 +743,12 @@ fn cmd_burn(flags: BurnFlags) {
     );
 
     if !partition.is_empty() && (erase_all || force_upgrade) {
-        eprintln!(
-            "Error: --partition (OS-only) cannot be combined with --erase-all or --force-upgrade"
-        );
+        eprintln!("Error: --partition cannot be combined with --erase-all or --force-upgrade");
         std::process::exit(2);
     }
 
     let selected_parts = if partition.is_empty() {
-        BurnOptions::default().selected_parts
+        artinchip_flash::device::default_burn_parts(&metas)
     } else {
         partition.clone()
     };
@@ -790,7 +788,7 @@ fn cmd_burn(flags: BurnFlags) {
                 "{}",
                 serde_json::json!({
                     "mode": burn_plan.mode,
-                    "mode_name": artinchip_flash::device::upg_mode_name(&plan_options),
+                    "mode_name": burn_plan.mode_name(),
                     "total_bytes": burn_plan.total_bytes,
                     "components": components,
                 })

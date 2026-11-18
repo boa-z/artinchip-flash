@@ -80,6 +80,12 @@ impl AicCsw {
     pub fn is_ok(&self) -> bool {
         self.signature() == AIC_USB_SIGN_USBS && self.status_val() == 0
     }
+
+    pub(crate) fn matches_padded_ack(&self, response: &[u8]) -> bool {
+        self.is_ok()
+            && self.data_residue_val() == 0
+            && response.strip_suffix(&[0; 3]) == Some(self.bytes.as_slice())
+    }
 }
 
 /// UPG Command Header (16 bytes)
@@ -189,28 +195,68 @@ impl HwInfo {
     pub fn chipid_val(&self) -> [u32; 4] {
         let mut ids = [0u32; 4];
         for (i, id) in ids.iter_mut().enumerate() {
-            let off = 48 + i * 4;
+            let off = 44 + i * 4;
             *id = u32::from_le_bytes(self.bytes[off..off + 4].try_into().unwrap());
         }
         ids
     }
 
     pub fn init_mode(&self) -> u32 {
-        u32::from_le_bytes(self.bytes[8..12].try_into().unwrap())
+        u32::from(self.bytes[38])
     }
 
     pub fn curr_mode(&self) -> u32 {
-        u32::from_le_bytes(self.bytes[12..16].try_into().unwrap())
+        u32::from(self.bytes[39])
     }
 
     pub fn boot_stage(&self) -> u32 {
-        u32::from_le_bytes(self.bytes[16..20].try_into().unwrap())
+        u32::from(self.bytes[40])
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn padded_ack_requires_the_successful_write_csw_and_zero_padding() {
+        let mut response = [0u8; 16];
+        response[..4].copy_from_slice(b"USBS");
+        response[4..8].copy_from_slice(&0x361u32.to_le_bytes());
+        let write_csw = AicCsw::from_bytes(&response).unwrap();
+        assert!(write_csw.matches_padded_ack(&response));
+        response[4] ^= 1;
+        assert!(!write_csw.matches_padded_ack(&response));
+        response[4] ^= 1;
+        response[15] = 1;
+        assert!(!write_csw.matches_padded_ack(&response));
+        response[15] = 0;
+        response[12] = 1;
+        let failed_csw = AicCsw::from_bytes(&response).unwrap();
+        assert!(!failed_csw.matches_padded_ack(&response));
+    }
+
+    #[test]
+    fn parses_boot_stage_after_hwinfo_reserved_bytes() {
+        let mut payload = [0u8; 108];
+        payload[..8].copy_from_slice(b"HWINFO\0\0");
+        payload[38..41].copy_from_slice(&[1, 4, 1]);
+        payload[44..60].copy_from_slice(&[
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10,
+        ]);
+        let bootloader = HwInfo::from_bytes(&payload).unwrap();
+        assert_eq!(bootloader.init_mode(), 1);
+        assert_eq!(bootloader.curr_mode(), 4);
+        assert_eq!(bootloader.boot_stage(), 1);
+        assert_eq!(
+            bootloader.chipid_val(),
+            [0x04030201, 0x08070605, 0x0c0b0a09, 0x100f0e0d]
+        );
+
+        payload[40] = 0;
+        assert_eq!(HwInfo::from_bytes(&payload).unwrap().boot_stage(), 0);
+    }
 
     #[test]
     fn parses_csw_status_and_tag() {

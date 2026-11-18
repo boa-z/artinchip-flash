@@ -869,6 +869,10 @@ impl UpgTransport for UsbTransport {
     fn transport_name(&self) -> &'static str {
         "USB"
     }
+
+    fn max_write_chunk(&self, _block_size: u32) -> usize {
+        BULK_WRITE_CHUNK
+    }
 }
 
 impl Drop for UsbTransport {

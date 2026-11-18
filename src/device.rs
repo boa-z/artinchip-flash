@@ -5,6 +5,7 @@ use std::sync::{
 use std::thread;
 use std::time::Duration;
 
+use crate::image::parser::FwHeader;
 use crate::log_verbose;
 use crate::protocol::cbw_csw::*;
 use crate::protocol::commands::*;
@@ -79,12 +80,14 @@ pub fn upg_mode(options: &BurnOptions) -> u8 {
 
 /// Human-readable upgrade-mode name for stage logs.
 pub fn upg_mode_name(options: &BurnOptions) -> &'static str {
-    if options.force_upgrade {
-        "force upgrade mode (BURN_IMG_FORCE, experimental)"
-    } else if options.partition_upgrade {
-        "partition upgrade mode"
-    } else {
-        "full-disk upgrade mode"
+    mode_name(upg_mode(options))
+}
+
+fn mode_name(mode: u8) -> &'static str {
+    match mode {
+        UPG_MODE_BURN_IMG_FORCE => "force upgrade mode (BURN_IMG_FORCE, experimental)",
+        UPG_MODE_PARTITION_UPGRADE => "partition upgrade mode",
+        _ => "full-disk upgrade mode",
     }
 }
 
@@ -209,19 +212,6 @@ impl<T: UpgTransport> UpgDevice<T> {
         self.read_upg_response(cmd, resp_extra, policy)
     }
 
-    fn cmd_hdr_len_prefixed_data_resp(
-        &mut self,
-        cmd: u8,
-        payload: &[u8],
-        resp_extra: usize,
-    ) -> Result<UpgResponse, String> {
-        self.send_hdr(cmd, (payload.len() + 4) as u32)?;
-        self.transport
-            .write_txn(&(payload.len() as u32).to_le_bytes(), CswPolicy::Required)?;
-        self.transport.write_txn(payload, CswPolicy::Required)?;
-        self.read_upg_response(cmd, resp_extra, CswPolicy::Required)
-    }
-
     fn cmd_hdr_resp(&mut self, cmd: u8, resp_extra: usize) -> Result<UpgResponse, String> {
         self.send_hdr(cmd, 0)?;
         self.read_upg_response(cmd, resp_extra, CswPolicy::Required)
@@ -340,7 +330,21 @@ impl<T: UpgTransport> UpgDevice<T> {
         let mut cfg = [0u8; 32];
         cfg[0] = mode;
         cfg[1..].copy_from_slice(&OFFICIAL_UPG_CFG_RESERVED);
-        let _resp = self.cmd_hdr_len_prefixed_data_resp(CMD_SET_UPG_CFG, &cfg, 0)?;
+        self.send_hdr(CMD_SET_UPG_CFG, (cfg.len() + 4) as u32)?;
+        self.transport
+            .write_txn(&(cfg.len() as u32).to_le_bytes(), CswPolicy::Required)?;
+        let write_csw = self.transport.write_txn(&cfg, CswPolicy::Required)?;
+        let response = self.read_txn_policy(RESP_MIN_HDR_LEN as u32, CswPolicy::Required)?;
+        if let Some(csw) = write_csw {
+            if csw.matches_padded_ack(&response) {
+                log_verbose!("SET_UPG_CFG acknowledged with a copy of the configuration write CSW");
+                return Ok(());
+            }
+        }
+        let header = self.parse_resp_header(CMD_SET_UPG_CFG, &response)?;
+        if header.data_length_val() != 0 {
+            return Err("SET_UPG_CFG returned unexpected response data".to_string());
+        }
         Ok(())
     }
 
@@ -592,9 +596,12 @@ impl<T: UpgTransport> UpgDevice<T> {
         &mut self,
         img_data: &[u8],
         metas: &[FwcMeta],
-        _header: &crate::image::parser::FwHeader,
+        _header: &FwHeader,
     ) -> Result<(), String> {
-        let options = BurnOptions::default();
+        let options = BurnOptions {
+            selected_parts: default_burn_parts(metas),
+            ..BurnOptions::default()
+        };
         self.burn_image_with_options(img_data, metas, &options, None)
     }
 
@@ -617,11 +624,7 @@ impl<T: UpgTransport> UpgDevice<T> {
             BurnEvent::Stage("Build component plan".to_string()),
         );
 
-        let total_bytes = classified
-            .iter()
-            .filter(|c| c.kind == ComponentKind::ImageInfo || c.selected)
-            .map(|c| c.meta.size_val() as usize)
-            .sum::<usize>();
+        let total_bytes = plan.total_bytes;
         let mut overall_sent = 0usize;
 
         // In bootloader upgrade mode the updater payload is neither needed
@@ -643,12 +646,19 @@ impl<T: UpgTransport> UpgDevice<T> {
             let updater_last_index = updater_components.len().saturating_sub(1);
             for (index, component) in updater_components.iter().enumerate() {
                 check_cancelled(options, &mut callback)?;
-                let allow_final_response_no_csw = index == updater_last_index;
+                let executable = component
+                    .meta
+                    .attr_str()
+                    .split(';')
+                    .any(|attr| attr == "run");
+                let allow_final_response_no_csw =
+                    index == updater_last_index || (plan.uses_header_media && executable);
                 self.send_component(
                     img_data,
                     options,
                     component,
                     allow_final_response_no_csw,
+                    plan.uses_header_media,
                     &mut overall_sent,
                     total_bytes,
                     &mut callback,
@@ -659,7 +669,15 @@ impl<T: UpgTransport> UpgDevice<T> {
                         &mut callback,
                         BurnEvent::Stage("Probe bootloader between updater components".to_string()),
                     );
-                    if let Err(e) = self.get_hwinfo() {
+                    let probe = self.get_hwinfo().or_else(|error| {
+                        if plan.uses_header_media && executable {
+                            self.transport.reconnect(options.burn_timeout)?;
+                            self.get_hwinfo()
+                        } else {
+                            Err(error)
+                        }
+                    });
+                    if let Err(e) = probe {
                         return Err(format!(
                             "Bootloader probe between updater components failed: {}",
                             e
@@ -684,8 +702,14 @@ impl<T: UpgTransport> UpgDevice<T> {
                 &mut callback,
                 BurnEvent::Stage("Probe bootloader after reconnect".to_string()),
             );
-            if let Err(e) = self.get_hwinfo() {
-                return Err(format!("Bootloader probe after reconnect failed: {}", e));
+            let hwinfo = self
+                .get_hwinfo()
+                .map_err(|error| format!("Bootloader probe after reconnect failed: {}", error))?;
+            if plan.uses_header_media && hwinfo.boot_stage() != 1 {
+                return Err(format!(
+                    "Expected U-Boot upgrade mode after SPL, got stage {}",
+                    hwinfo.boot_stage()
+                ));
             }
         } else if updater_count > 0 {
             emit(
@@ -707,9 +731,9 @@ impl<T: UpgTransport> UpgDevice<T> {
 
         emit(
             &mut callback,
-            BurnEvent::Stage(format!("Set {} upgrade mode", upg_mode_name(options))),
+            BurnEvent::Stage(format!("Set {}", plan.mode_name())),
         );
-        self.set_upg_cfg(upg_mode(options))?;
+        self.set_upg_cfg(plan.mode)?;
 
         if let Some(info) = classified
             .iter()
@@ -720,6 +744,7 @@ impl<T: UpgTransport> UpgDevice<T> {
                 options,
                 info,
                 false,
+                plan.uses_header_media,
                 &mut overall_sent,
                 total_bytes,
                 &mut callback,
@@ -745,6 +770,7 @@ impl<T: UpgTransport> UpgDevice<T> {
                 options,
                 component,
                 false,
+                plan.uses_header_media,
                 &mut overall_sent,
                 total_bytes,
                 &mut callback,
@@ -783,6 +809,7 @@ impl<T: UpgTransport> UpgDevice<T> {
         options: &BurnOptions,
         component: &FirmwareComponent<'_>,
         allow_final_no_csw: bool,
+        uses_header_media: bool,
         overall_sent: &mut usize,
         overall_total: usize,
         callback: &mut Option<&mut BurnCallback<'_>>,
@@ -827,13 +854,21 @@ impl<T: UpgTransport> UpgDevice<T> {
 
         self.set_fwc_meta(meta)?;
 
-        let block_size = self.get_block_size().unwrap_or(2048);
+        let block_size = if uses_header_media {
+            self.get_block_size()?
+        } else {
+            self.get_block_size().unwrap_or(2048)
+        };
+        if uses_header_media && !(1..=CHUNK_SIZE).contains(&block_size) {
+            return Err(format!(
+                "{}: invalid device block size {}",
+                name, block_size
+            ));
+        }
         emit(
             callback,
             BurnEvent::Log(format!("Block size: {}", block_size)),
         );
-
-        self.start_fwc_data(size)?;
 
         let mut data_sent = 0usize;
         let base_chunk = if component.kind == ComponentKind::Updater {
@@ -841,13 +876,29 @@ impl<T: UpgTransport> UpgDevice<T> {
         } else {
             CHUNK_SIZE as usize
         };
-        let transport_chunk = self.transport.max_write_chunk(block_size);
-        let chunk_max = base_chunk.min(transport_chunk).max(1);
+        let transport_chunk = self.transport.max_write_chunk(block_size).max(1);
+        let streams_blocks = uses_header_media
+            && component.kind == ComponentKind::Target
+            && meta.attr_str().split(';').any(|attr| attr == "ubi");
+        let alignment = if uses_header_media && !streams_blocks {
+            block_size as usize
+        } else {
+            1
+        };
+        let mut chunk_max = base_chunk.min(transport_chunk);
+        chunk_max -= chunk_max % alignment;
+        if chunk_max == 0 {
+            return Err(format!(
+                "{}: device block size exceeds the transport chunk limit",
+                name
+            ));
+        }
         log_verbose!(
             "    Write chunk: {} bytes ({})",
             chunk_max,
             self.transport.transport_name()
         );
+        self.start_fwc_data(size)?;
         while data_sent < size {
             check_cancelled(options, callback)?;
             let chunk_end = (data_sent + chunk_max).min(size);
@@ -855,7 +906,13 @@ impl<T: UpgTransport> UpgDevice<T> {
             let chunk_size = chunk_end - data_sent;
             let chunk_data = &img_data[chunk_offset..chunk_offset + chunk_size];
 
-            self.write_fwc_data_chunk(chunk_data, CswPolicy::Required)?;
+            if chunk_size % alignment == 0 {
+                self.write_fwc_data_chunk(chunk_data, CswPolicy::Required)?;
+            } else {
+                let mut padded = chunk_data.to_vec();
+                padded.resize(chunk_size.next_multiple_of(alignment), 0);
+                self.write_fwc_data_chunk(&padded, CswPolicy::Required)?;
+            }
             data_sent += chunk_size;
             *overall_sent += chunk_size;
             log_verbose!(
@@ -896,6 +953,24 @@ impl<T: UpgTransport> UpgDevice<T> {
                 name, crc_expected, actual_crc
             ));
         }
+        if uses_header_media && !allow_final_no_csw {
+            let device_crc = self.fwc_result(CMD_GET_FWC_CRC)?;
+            if device_crc != crc_expected {
+                return Err(format!(
+                    "{}: device CRC mismatch (expected 0x{:08x}, actual 0x{:08x})",
+                    name, crc_expected, device_crc
+                ));
+            }
+            for (cmd, action) in [
+                (CMD_GET_FWC_BURN_RESULT, "burn"),
+                (CMD_GET_FWC_RUN_RESULT, "run"),
+            ] {
+                let result = self.fwc_result(cmd)?;
+                if result != 0 {
+                    return Err(format!("{}: device {} result {:#x}", name, action, result));
+                }
+            }
+        }
         emit(
             callback,
             BurnEvent::Log(format!("CRC OK (0x{:08x})", actual_crc)),
@@ -907,6 +982,17 @@ impl<T: UpgTransport> UpgDevice<T> {
             },
         );
         Ok(())
+    }
+
+    fn fwc_result(&mut self, cmd: u8) -> Result<u32, String> {
+        let response = self.cmd_hdr_resp(cmd, 4)?;
+        let bytes: [u8; 4] = response.payload.as_slice().try_into().map_err(|_| {
+            format!(
+                "Command 0x{:02x} returned an invalid FWC result length",
+                cmd
+            )
+        })?;
+        Ok(u32::from_le_bytes(bytes))
     }
 }
 
@@ -953,14 +1039,32 @@ fn classify_components<'a>(
 }
 
 fn target_part_selected(meta: &FwcMeta, selected_parts: &[String]) -> bool {
+    selected_parts
+        .iter()
+        .any(|part| target_part_matches(meta, part))
+}
+
+fn target_part_matches(meta: &FwcMeta, part: &str) -> bool {
+    let part = part.trim();
     let partition = meta.partition_str();
     let target_name = meta
         .name_str()
         .strip_prefix("image.target.")
         .unwrap_or_else(|| meta.name_str());
-    selected_parts
+    partition == part || target_name == part || meta.name_str() == part
+}
+
+pub fn default_burn_target(name: &str, media: &str) -> bool {
+    name.strip_prefix("image.target.")
+        .is_some_and(|part| media.is_empty() || ["spl", "env", "os"].contains(&part))
+}
+
+pub fn default_burn_parts(metas: &[FwcMeta]) -> Vec<String> {
+    metas
         .iter()
-        .any(|part| partition == part || target_name == part || meta.name_str() == part)
+        .filter(|meta| default_burn_target(meta.name_str(), meta.partition_media()))
+        .map(|meta| meta.name_str().to_string())
+        .collect()
 }
 
 /// One component in a validated host-side burn plan.
@@ -987,6 +1091,13 @@ pub struct BurnPlan {
     pub components: Vec<BurnPlanComponent>,
     pub mode: u8,
     pub total_bytes: usize,
+    uses_header_media: bool,
+}
+
+impl BurnPlan {
+    pub fn mode_name(&self) -> &'static str {
+        mode_name(self.mode)
+    }
 }
 
 /// Validate the image and selection, and build the exact component plan.
@@ -1012,8 +1123,15 @@ pub fn plan_burn(
     }
 
     let classified = classify_components(metas, &options.selected_parts);
+    let header = FwHeader::from_bytes(img_data);
+    let image_media = header
+        .as_ref()
+        .filter(|header| header.magic_str() == "AIC.FW")
+        .map_or("", FwHeader::media_type_str);
+    let mut uses_header_media = false;
+    let mut info_is_header = false;
     let mut names = std::collections::BTreeSet::new();
-    let mut target_parts: Vec<String> = Vec::new();
+    let mut target_parts = Vec::new();
     let mut info_count = 0usize;
     let mut selected_count = 0usize;
     let mut total = 0usize;
@@ -1059,7 +1177,7 @@ pub fn plan_burn(
             ));
         }
 
-        let media = meta.partition_media();
+        let mut media = meta.partition_media();
         let kind = match component.kind {
             ComponentKind::Updater => {
                 if !media.is_empty() && media != "ram" {
@@ -1069,6 +1187,8 @@ pub fn plan_burn(
             }
             ComponentKind::ImageInfo => {
                 info_count += 1;
+                info_is_header =
+                    offset == 0 && size as usize == crate::image::parser::FW_HEADER_SIZE;
                 if !media.is_empty() && media != "ram" {
                     return Err(format!("{}: image.info must be a RAM component", name));
                 }
@@ -1078,10 +1198,19 @@ pub fn plan_burn(
                 if meta.partition_str().is_empty() {
                     return Err(format!("{}: target has no partition name", name));
                 }
-                if media.is_empty() || media == "ram" {
+                if meta.uses_image_media() {
+                    if !matches!(image_media, "spi-nand" | "spi-nor" | "mmc") {
+                        return Err(format!(
+                            "{}: unsupported image storage media '{}'",
+                            name, image_media
+                        ));
+                    }
+                    media = image_media;
+                    uses_header_media = true;
+                } else if media.is_empty() || media == "ram" {
                     return Err(format!("{}: target has no storage media", name));
                 }
-                target_parts.push(meta.partition_str().to_string());
+                target_parts.push(meta);
                 if component.selected {
                     selected_count += 1;
                 }
@@ -1091,7 +1220,8 @@ pub fn plan_burn(
                 return Err(format!("{}: unsupported META component", name));
             }
         };
-        if kind != "target" || component.selected {
+        let selected = component.selected && !(options.no_updater && kind == "updater");
+        if selected {
             total += size as usize;
         }
         components.push(BurnPlanComponent {
@@ -1101,7 +1231,7 @@ pub fn plan_burn(
             media: media.to_string(),
             size,
             crc: meta.crc_val(),
-            selected: component.selected,
+            selected,
         });
     }
 
@@ -1111,21 +1241,26 @@ pub fn plan_burn(
             info_count
         ));
     }
+    if uses_header_media && !info_is_header {
+        return Err(
+            "image.info must reference the image header for header-media targets".to_string(),
+        );
+    }
     for part in &options.selected_parts {
         let part = part.trim();
         let matches = target_parts
             .iter()
-            .filter(|target| {
-                target.as_str() == part
-                    || format!("image.target.{}", target) == part
-                    || format!("image.target.{}", part) == **target
-            })
+            .filter(|target| target_part_matches(target, part))
             .count();
         if matches == 0 {
             return Err(format!(
                 "Unknown target partition '{}'; available: {}",
                 part,
-                target_parts.join(", ")
+                target_parts
+                    .iter()
+                    .map(|meta| meta.name_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
         if matches > 1 {
@@ -1139,10 +1274,21 @@ pub fn plan_burn(
         return Err("No target components selected".to_string());
     }
 
+    let mode = if uses_header_media && selected_count < target_parts.len() {
+        if options.force_upgrade {
+            return Err(
+                "Linux partition selection cannot be combined with force upgrade".to_string(),
+            );
+        }
+        UPG_MODE_PARTITION_UPGRADE
+    } else {
+        upg_mode(options)
+    };
     Ok(BurnPlan {
         components,
-        mode: upg_mode(options),
+        mode,
         total_bytes: total,
+        uses_header_media,
     })
 }
 
@@ -1208,6 +1354,7 @@ mod tests {
         reads: usize,
         panic_on_use: bool,
         max_chunk: usize,
+        block_size: u32,
         /// `SET_UPG_CFG` mode bytes observed on the wire (32-byte cfg payload).
         upg_modes: Vec<u8>,
         /// Whether any write payload contained the `reset` shell command.
@@ -1264,8 +1411,21 @@ mod tests {
                 return Ok(Self::ok_resp_header());
             }
             if read_len as usize == 4 {
-                // Block-size payload.
-                return Ok(512u32.to_le_bytes().to_vec());
+                let cmd = self.payloads.last().and_then(|payload| payload.get(6));
+                let value = match cmd.copied() {
+                    Some(CMD_GET_FWC_CRC) => self
+                        .payloads
+                        .iter()
+                        .rev()
+                        .find_map(|payload| {
+                            FwcMeta::from_bytes(payload).filter(|meta| meta.magic_str() == "META")
+                        })
+                        .unwrap()
+                        .crc_val(),
+                    Some(CMD_GET_FWC_BURN_RESULT | CMD_GET_FWC_RUN_RESULT) => 0,
+                    _ => self.block_size,
+                };
+                return Ok(value.to_le_bytes().to_vec());
             }
             Ok(vec![0u8; read_len as usize])
         }
@@ -1339,6 +1499,7 @@ mod tests {
             reads: 0,
             panic_on_use: true,
             max_chunk: 512,
+            block_size: 512,
             upg_modes: Vec::new(),
             saw_reset: false,
             payloads: Vec::new(),
@@ -1375,6 +1536,7 @@ mod tests {
             reads: 0,
             panic_on_use: false,
             max_chunk: 512,
+            block_size: 512,
             upg_modes: Vec::new(),
             saw_reset: false,
             payloads: Vec::new(),
@@ -1436,6 +1598,7 @@ mod tests {
             reads: 0,
             panic_on_use: false,
             max_chunk: 4096,
+            block_size: 512,
             upg_modes: Vec::new(),
             saw_reset: false,
             payloads: Vec::new(),
@@ -1476,6 +1639,7 @@ mod tests {
             reads: 0,
             panic_on_use: false,
             max_chunk: 4096,
+            block_size: 512,
             upg_modes: Vec::new(),
             saw_reset: false,
             payloads: Vec::new(),
@@ -1506,6 +1670,7 @@ mod tests {
             reads: 0,
             panic_on_use: false,
             max_chunk: 4096,
+            block_size: 512,
             upg_modes: Vec::new(),
             saw_reset: false,
             payloads: Vec::new(),
@@ -1781,6 +1946,173 @@ mod tests {
             })
             .collect();
         (img, metas)
+    }
+
+    #[test]
+    fn linux_plan_inherits_header_media_and_selects_component_aliases() {
+        let header_size = crate::image::parser::FW_HEADER_SIZE;
+        let mut img = vec![0; header_size + 9];
+        img[..6].copy_from_slice(b"AIC.FW");
+        img[200..208].copy_from_slice(b"spi-nand");
+        let info = make_meta(
+            "image.info",
+            "",
+            0,
+            header_size as u32,
+            crc32fast::hash(&img[..header_size]),
+        );
+        let mut metas = vec![info];
+        for (index, (name, partition)) in [
+            ("image.target.spl", "spl"),
+            ("image.target.env", "env;env_r"),
+            ("image.target.rootfs", "ubiroot:rootfs"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let offset = header_size + index * 3;
+            let mut meta = make_meta(
+                name,
+                partition,
+                offset as u32,
+                3,
+                crc32fast::hash(&img[offset..offset + 3]),
+            );
+            meta.bytes[112..136].fill(0);
+            metas.push(meta);
+        }
+        let options = BurnOptions {
+            selected_parts: default_burn_parts(&metas),
+            ..Default::default()
+        };
+        let full = plan_burn(&img, &metas, &options).unwrap();
+        assert_eq!(full.mode, UPG_MODE_FULL_DISK_UPGRADE);
+        assert!(full.uses_header_media);
+        assert_eq!(full.total_bytes, img.len());
+        assert!(full.components[1..]
+            .iter()
+            .all(|entry| entry.selected && entry.media == "spi-nand"));
+        assert_eq!(full.components[2].partition, "env;env_r");
+        for alias in ["rootfs", "image.target.rootfs", "ubiroot:rootfs"] {
+            let options = BurnOptions {
+                selected_parts: vec![alias.to_string()],
+                ..Default::default()
+            };
+            let partial = plan_burn(&img, &metas, &options).unwrap();
+            assert_eq!(partial.mode, UPG_MODE_PARTITION_UPGRADE);
+            assert_eq!(partial.total_bytes, header_size + 3);
+            assert!(partial.components[3].selected);
+        }
+        metas[1].bytes[112..115].copy_from_slice(b"ram");
+        assert!(plan_burn(&img, &metas, &options)
+            .unwrap_err()
+            .contains("target has no storage media"));
+    }
+
+    #[test]
+    fn linux_component_preserves_meta_and_checks_device_results_after_aligned_write() {
+        let img = [0x11, 0x22, 0x33];
+        let mut meta = make_meta("image.target.env", "env;env_r", 0, 3, crc32fast::hash(&img));
+        meta.bytes[112..136].fill(0);
+        let component = FirmwareComponent {
+            meta: &meta,
+            kind: ComponentKind::Target,
+            selected: true,
+        };
+        let mut dev = mock_device();
+        let mut sent = 0;
+        dev.send_component(
+            &img,
+            &BurnOptions::default(),
+            &component,
+            false,
+            true,
+            &mut sent,
+            img.len(),
+            &mut None,
+        )
+        .unwrap();
+        assert_eq!(sent, img.len());
+        let writes = &dev.transport_mut().payloads;
+        assert_eq!(writes[1], meta.to_bytes());
+        assert_eq!(writes[3], CmdHeader::new(CMD_SEND_FWC_DATA, 3).to_bytes());
+        assert_eq!(writes[4].len(), 512);
+        assert_eq!(writes[4][..3], img);
+        assert!(writes[4][3..].iter().all(|&byte| byte == 0));
+        assert_eq!(writes[5], CmdHeader::new(CMD_GET_FWC_CRC, 0).to_bytes());
+        assert_eq!(
+            writes[6],
+            CmdHeader::new(CMD_GET_FWC_BURN_RESULT, 0).to_bytes()
+        );
+        assert_eq!(
+            writes[7],
+            CmdHeader::new(CMD_GET_FWC_RUN_RESULT, 0).to_bytes()
+        );
+    }
+
+    #[test]
+    fn linux_nand_sends_separate_usb_transactions_at_the_gadget_limit() {
+        for (name, partition, attrs, block_size, size, expected) in [
+            (
+                "spl",
+                "spl",
+                "mtd;required",
+                2048,
+                142_864,
+                &[65_536, 65_536, 12_288][..],
+            ),
+            (
+                "rootfs",
+                "ubiroot:rootfs",
+                "ubi;required",
+                126_976,
+                126_976 + 1,
+                &[65_536, 61_441][..],
+            ),
+        ] {
+            let img = vec![0xab; size];
+            let mut meta = make_meta(
+                &format!("image.target.{name}"),
+                partition,
+                0,
+                size as u32,
+                crc32fast::hash(&img),
+            );
+            meta.bytes[112..136].fill(0);
+            meta.bytes[152..152 + attrs.len()].copy_from_slice(attrs.as_bytes());
+            let component = FirmwareComponent {
+                meta: &meta,
+                kind: ComponentKind::Target,
+                selected: true,
+            };
+            let mut dev = mock_device();
+            dev.transport_mut().max_chunk = 65_536;
+            dev.transport_mut().block_size = block_size;
+            let mut sent = 0;
+            dev.send_component(
+                &img,
+                &BurnOptions::default(),
+                &component,
+                false,
+                true,
+                &mut sent,
+                size,
+                &mut None,
+            )
+            .unwrap();
+            assert_eq!(sent, size);
+            let writes = &dev.transport_mut().payloads;
+            assert_eq!(
+                writes[3],
+                CmdHeader::new(CMD_SEND_FWC_DATA, size as u32).to_bytes()
+            );
+            let packets = &writes[4..writes.len() - 3];
+            let lengths: Vec<_> = packets.iter().map(Vec::len).collect();
+            assert_eq!(lengths, expected);
+            let data = packets.concat();
+            assert_eq!(&data[..size], &img);
+            assert!(data[size..].iter().all(|&byte| byte == 0));
+        }
     }
 
     #[test]

@@ -102,9 +102,15 @@ artinchip-flash burn firmware.img --partition os
 artinchip-flash burn firmware.img --partition os --no-updater
 ```
 
-`--partition` accepts repeatable or comma-separated names and selects only
-the matching `image.target.*` components; without it the legacy `spl,env,os`
-set is used.  Explicit selection also sends `UPG_MODE_PARTITION_UPGRADE`.
+`--partition` accepts repeatable or comma-separated component names (`os`,
+`image.target.rootfs`) or the exact META partition value (`ubiroot:rootfs`).
+Explicit selection sends `UPG_MODE_PARTITION_UPGRADE`. With no explicit
+selection, RT-Thread images default to `spl,env,os`. Luban Linux images
+with name-only target META default to all packaged targets.
+
+Linux images use `image.info` to tell U-Boot which storage medium to
+initialize. The host sends the original META to preserve MTD partition lists
+such as `env;env_r` and UBI destinations such as `ubiroot:rootfs`.
 
 Important: the D213 bootloader only stores/logs the mode byte
 (`aicupg_set_upg_cfg` in `upg_main.c`); the **component list sent by the host**
