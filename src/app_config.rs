@@ -13,6 +13,8 @@ pub struct AppConfig {
     pub block_error_log: bool,
     pub burn_timeout_secs: u64,
     pub language: String,
+    pub gui_theme: String,
+    pub adb_executable: Option<PathBuf>,
     pub image_path: Option<PathBuf>,
     pub selected_parts: Vec<String>,
     pub app_dir: PathBuf,
@@ -57,6 +59,8 @@ impl Default for AppConfig {
             block_error_log: false,
             burn_timeout_secs: 60,
             language: "zh_cn".to_string(),
+            gui_theme: "system".to_string(),
+            adb_executable: None,
             image_path: None,
             selected_parts: vec!["spl".to_string(), "env".to_string(), "os".to_string()],
             app_dir,
@@ -175,6 +179,13 @@ impl AppConfig {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("Failed to create '{}': {}", parent.display(), e))?;
         }
+        let adb = self
+            .adb_executable
+            .as_deref()
+            .map_or_else(String::new, |path| {
+                path.to_string_lossy().replace('\\', "/")
+            });
+        let text = format!("{text}gui_theme={}\nadb_executable={adb}\n", self.gui_theme);
         fs::write(path, text).map_err(|e| format!("Failed to write '{}': {}", path.display(), e))
     }
 
@@ -198,6 +209,14 @@ impl AppConfig {
                     .max(1)
             }
             ("system", "language") => self.language = value.to_string(),
+            ("common", "gui_theme") => {
+                if matches!(value, "system" | "light" | "dark") {
+                    self.gui_theme = value.to_string();
+                }
+            }
+            ("common", "adb_executable") => {
+                self.adb_executable = (!value.is_empty()).then(|| PathBuf::from(value))
+            }
             ("common", "image_path") => {
                 if !value.is_empty() {
                     self.image_path = Some(PathBuf::from(value));
@@ -414,6 +433,8 @@ mod tests {
         cfg.serial_baud = 921600;
         cfg.serial_speed = 1500000;
         cfg.serial_auto_enter = false;
+        cfg.gui_theme = "dark".to_string();
+        cfg.adb_executable = Some(dir.join("adb-tool"));
         cfg.update_channel = "nightly".to_string();
         cfg.auto_check_update = false;
         cfg.last_update_check_unix = 1234567890;
@@ -435,6 +456,8 @@ mod tests {
         assert_eq!(loaded.serial_baud, 921600);
         assert_eq!(loaded.serial_speed, 1500000);
         assert!(!loaded.serial_auto_enter);
+        assert_eq!(loaded.gui_theme, "dark");
+        assert_eq!(loaded.adb_executable, cfg.adb_executable);
         assert_eq!(loaded.update_channel, "nightly");
         assert!(!loaded.auto_check_update);
         assert_eq!(loaded.last_update_check_unix, 1234567890);

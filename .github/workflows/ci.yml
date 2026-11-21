@@ -18,8 +18,12 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install repository Rust toolchain
+        run: rustup show
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
@@ -31,14 +35,49 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install libusb
 
+      - name: Install shared libusb on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $root = $env:VCPKG_INSTALLATION_ROOT
+          $arch = if ($env:RUNNER_ARCH -eq 'ARM64') { 'arm64' } else { 'x64' }
+          $triplet = "$arch-windows"
+          & "$root/vcpkg.exe" install "libusb:$triplet"
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg libusb install failed' }
+          "VCPKG_ROOT=$root" >> $env:GITHUB_ENV
+          "VCPKGRS_TRIPLET=$triplet" >> $env:GITHUB_ENV
+          'VCPKGRS_DYNAMIC=1' >> $env:GITHUB_ENV
+          "$root/installed/$triplet/bin" >> $env:GITHUB_PATH
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
       - name: Check
-        run: cargo check --all-targets
+        run: cargo check --locked --workspace --all-targets
+
+      - name: Lint
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test
+        run: cargo test --locked --workspace --all-targets
+
+      - name: Independent core and SDK feature builds
+        shell: bash
+        run: |
+          cargo test --locked -p aic-upg-core
+          cargo check --locked -p artinchip-flash --no-default-features
+          cargo check --locked -p artinchip-flash --no-default-features --features usb
+          cargo check --locked -p artinchip-flash --no-default-features --features uart
+          python scripts/check_sdk_consumer.py
+
+      - name: Audit dependency licenses and collect attributions
+        shell: bash
+        run: |
+          target="$(rustc -vV | sed -n 's/^host: //p')"
+          python scripts/dependency_licenses.py --target "$target" --output THIRD-PARTY-LICENSES.txt
 
       - name: Build release binaries
-        run: cargo build --release --bins
+        run: cargo build --locked --release --bins
 
       - name: Package Windows artifacts
         if: runner.os == 'Windows'
@@ -51,7 +90,27 @@ jobs:
 
           Copy-Item target/release/artinchip-flash.exe "dist/artinchip-flash-$system.exe"
           Copy-Item target/release/artinchip-flash-gui.exe "dist/artinchip-flash-gui-$system.exe"
-          Copy-Item README.md dist/
+          Copy-Item README.md, LICENSE, NOTICE, THIRD-PARTY-LICENSES.txt dist/
+          $linkLog = Get-ChildItem target/release/build/libusb1-sys-*/output | Get-Content
+          if ($linkLog -contains 'cargo:vendored=1' -or $linkLog -notcontains 'cargo:rustc-link-lib=libusb-1.0') {
+            throw 'Release must link against the replaceable libusb DLL'
+          }
+          $installed = "$env:VCPKG_ROOT/installed/$env:VCPKGRS_TRIPLET"
+          Copy-Item "$installed/bin/libusb-1.0.dll" dist/
+          $port = "$env:VCPKG_ROOT/ports/libusb"
+          $libusbManifest = Get-Content "$port/vcpkg.json" -Raw | ConvertFrom-Json
+          $libusbVersion = $libusbManifest.version ?? $libusbManifest.'version-semver' ?? $libusbManifest.'version-string'
+          if (!$libusbVersion) { throw 'Cannot identify libusb source version' }
+          New-Item -ItemType Directory -Force libusb-sources | Out-Null
+          Copy-Item $port libusb-sources/vcpkg-port -Recurse
+          $source = "libusb-sources/libusb-$libusbVersion.tar.gz"
+          Invoke-WebRequest "https://github.com/libusb/libusb/archive/v$libusbVersion.tar.gz" -OutFile $source
+          $checksum = (Select-String -Path "$port/portfile.cmake" -Pattern 'SHA512\s+([a-fA-F0-9]{128})').Matches.Groups[1].Value
+          if ((Get-FileHash -Algorithm SHA512 $source).Hash -ne $checksum) { throw 'libusb source checksum mismatch' }
+          Copy-Item "$installed/share/libusb/copyright" libusb-sources/COPYING
+          Compress-Archive -Path libusb-sources/* -DestinationPath dist/libusb-source.zip -Force
+          & "./dist/artinchip-flash-$system.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw 'Portable CLI cannot load its runtime dependencies' }
           Compress-Archive -Path dist/* -DestinationPath "packages/$archive" -Force
 
           dotnet tool install --global wix --version 5.0.2
@@ -80,6 +139,11 @@ jobs:
                 <ComponentRef Id="CliExe" />
                 <ComponentRef Id="GuiExe" />
                 <ComponentRef Id="ReadmeFile" />
+                <ComponentRef Id="ProjectLicense" />
+                <ComponentRef Id="ProjectNotice" />
+                <ComponentRef Id="ThirdPartyLicenses" />
+                <ComponentRef Id="LibusbDll" />
+                <ComponentRef Id="LibusbSource" />
                 <ComponentRef Id="StartMenuShortcut" />
               </Feature>
 
@@ -95,6 +159,22 @@ jobs:
                 <File Id="Readme" Source="README.md" Name="README.md" KeyPath="yes" />
               </Component>
 
+              <Component Id="ProjectLicense" Directory="INSTALLFOLDER" Guid="*">
+                <File Source="LICENSE" KeyPath="yes" />
+              </Component>
+              <Component Id="ProjectNotice" Directory="INSTALLFOLDER" Guid="*">
+                <File Source="NOTICE" KeyPath="yes" />
+              </Component>
+              <Component Id="ThirdPartyLicenses" Directory="INSTALLFOLDER" Guid="*">
+                <File Source="THIRD-PARTY-LICENSES.txt" KeyPath="yes" />
+              </Component>
+              <Component Id="LibusbDll" Directory="INSTALLFOLDER" Guid="*">
+                <File Source="dist\libusb-1.0.dll" KeyPath="yes" />
+              </Component>
+              <Component Id="LibusbSource" Directory="INSTALLFOLDER" Guid="*">
+                <File Source="dist\libusb-source.zip" KeyPath="yes" />
+              </Component>
+
               <Component Id="StartMenuShortcut" Directory="ApplicationProgramsFolder" Guid="*">
                 <Shortcut Id="ArtInChipFlashGuiShortcut" Name="artinchip-flash GUI" Target="[INSTALLFOLDER]artinchip-flash-gui.exe" WorkingDirectory="INSTALLFOLDER" Icon="ArtInChipFlashIcon" />
                 <RemoveFolder Id="RemoveApplicationProgramsFolder" On="uninstall" />
@@ -104,9 +184,11 @@ jobs:
           </Wix>
           "@ | Set-Content -Path installer.wxs -Encoding UTF8
           wix build installer.wxs -o "packages/artinchip-flash-$system.msi"
+          if ($LASTEXITCODE -ne 0) { throw 'WiX build failed' }
           Remove-Item -Path packages/*.wixpdb -ErrorAction SilentlyContinue
 
-          choco install innosetup --no-progress -y
+          choco install innosetup --version=6.2.2 --allow-downgrade --no-progress -y
+          if ($LASTEXITCODE -ne 0) { throw 'Inno Setup installation failed' }
           @"
           #define AppName "artinchip-flash ArtInChip Flasher"
           #define AppVersion "$version"
@@ -136,6 +218,11 @@ jobs:
           Source: "target\release\artinchip-flash.exe"; DestDir: "{app}"; Flags: ignoreversion
           Source: "target\release\artinchip-flash-gui.exe"; DestDir: "{app}"; Flags: ignoreversion
           Source: "README.md"; DestDir: "{app}"; Flags: ignoreversion
+          Source: "LICENSE"; DestDir: "{app}"; Flags: ignoreversion
+          Source: "NOTICE"; DestDir: "{app}"; Flags: ignoreversion
+          Source: "THIRD-PARTY-LICENSES.txt"; DestDir: "{app}"; Flags: ignoreversion
+          Source: "dist\libusb-1.0.dll"; DestDir: "{app}"; Flags: ignoreversion
+          Source: "dist\libusb-source.zip"; DestDir: "{app}"; Flags: ignoreversion
 
           [Icons]
           Name: "{group}\artinchip-flash GUI"; Filename: "{app}\artinchip-flash-gui.exe"; WorkingDir: "{app}"
@@ -149,6 +236,25 @@ jobs:
             & $iscc installer.iss
           } else {
             iscc installer.iss
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'Inno Setup build failed' }
+
+          $msi = (Resolve-Path "packages/artinchip-flash-$system.msi").Path
+          $msiRoot = Join-Path (Get-Location) 'verified-msi'
+          $extract = Start-Process msiexec.exe -ArgumentList "/a `"$msi`" /qn TARGETDIR=`"$msiRoot`"" -Wait -PassThru
+          if ($extract.ExitCode -ne 0) { throw "MSI extraction failed ($($extract.ExitCode))" }
+          Invoke-WebRequest 'https://constexpr.org/innoextract/files/innoextract-1.9-windows.zip' -OutFile innoextract.zip
+          Expand-Archive innoextract.zip -DestinationPath innoextract-bin
+          $inno = (Get-ChildItem innoextract-bin -Recurse -Filter innoextract.exe | Select-Object -First 1).FullName
+          & $inno --extract --output-dir verified-inno "packages/artinchip-flash-$system-setup.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'Inno Setup extraction failed' }
+          Expand-Archive "packages/$archive" -DestinationPath verified-portable
+          $msiPayload = (Get-ChildItem verified-msi -Recurse -Filter artinchip-flash.exe | Select-Object -First 1).Directory.FullName
+          $innoPayload = (Get-ChildItem verified-inno -Recurse -Filter artinchip-flash.exe | Select-Object -First 1).Directory.FullName
+          foreach ($payload in 'verified-portable', $msiPayload, $innoPayload) {
+            foreach ($file in 'LICENSE', 'NOTICE', 'THIRD-PARTY-LICENSES.txt', 'libusb-source.zip', 'libusb-1.0.dll') {
+              if ((Get-FileHash "$payload/$file").Hash -ne (Get-FileHash "dist/$file").Hash) { throw "$file differs in $payload" }
+            }
           }
 
       - name: Package Linux artifacts
@@ -165,7 +271,7 @@ jobs:
           mkdir -p packages dist
           cp target/release/artinchip-flash "dist/artinchip-flash-${system}"
           cp target/release/artinchip-flash-gui "dist/artinchip-flash-gui-${system}"
-          cp README.md dist/
+          cp README.md LICENSE NOTICE THIRD-PARTY-LICENSES.txt dist/
           tar -czf "packages/$archive" -C dist .
 
           pkgroot="deb-root"
@@ -173,6 +279,7 @@ jobs:
           install -m 0755 target/release/artinchip-flash "$pkgroot/usr/bin/artinchip-flash"
           install -m 0755 target/release/artinchip-flash-gui "$pkgroot/usr/bin/artinchip-flash-gui"
           install -m 0644 README.md "$pkgroot/usr/share/doc/artinchip-flash/README.md"
+          install -m 0644 LICENSE NOTICE THIRD-PARTY-LICENSES.txt "$pkgroot/usr/share/doc/artinchip-flash/"
           install -m 0644 assets/icons/artinchip-flash-256.png "$pkgroot/usr/share/icons/hicolor/256x256/apps/artinchip-flash.png"
           cat > "$pkgroot/usr/share/applications/artinchip-flash-gui.desktop" <<'EOF'
           [Desktop Entry]
@@ -219,6 +326,14 @@ jobs:
            Cross-platform CLI and GUI flasher for ArtInChip SoCs.
           EOF
           dpkg-deb --build "$pkgroot" "packages/artinchip-flash-${system}.deb"
+          test "$(dpkg-deb -f "packages/artinchip-flash-${system}.deb" Package)" = artinchip-flash
+          test "$(dpkg-deb -f "packages/artinchip-flash-${system}.deb" Version)" = "$version"
+          ldd target/release/artinchip-flash | grep -F 'libusb-1.0.so'
+          dpkg-deb -x "packages/artinchip-flash-${system}.deb" verified-deb
+          for file in LICENSE NOTICE THIRD-PARTY-LICENSES.txt; do
+            tar -xOf "packages/$archive" "./$file" | cmp "$file" -
+            cmp "$file" "verified-deb/usr/share/doc/artinchip-flash/$file"
+          done
 
       - name: Package macOS artifacts
         if: runner.os == 'macOS'
@@ -229,7 +344,7 @@ jobs:
           mkdir -p packages dist
           cp target/release/artinchip-flash "dist/artinchip-flash-${system}"
           cp target/release/artinchip-flash-gui "dist/artinchip-flash-gui-${system}"
-          cp README.md dist/
+          cp README.md LICENSE NOTICE THIRD-PARTY-LICENSES.txt dist/
           tar -czf "packages/$archive" -C dist .
 
           pkgroot="pkg-root"
@@ -238,6 +353,9 @@ jobs:
           install -m 0755 target/release/artinchip-flash "$pkgroot/usr/local/bin/artinchip-flash"
           install -m 0755 target/release/artinchip-flash-gui "$app/Contents/MacOS/artinchip-flash-gui"
           install -m 0644 assets/artinchip-flash.icns "$app/Contents/Resources/artinchip-flash.icns"
+          install -m 0644 LICENSE NOTICE THIRD-PARTY-LICENSES.txt "$app/Contents/Resources/"
+          mkdir -p "$pkgroot/usr/local/share/doc/artinchip-flash"
+          install -m 0644 LICENSE NOTICE THIRD-PARTY-LICENSES.txt "$pkgroot/usr/local/share/doc/artinchip-flash/"
           cat > "$app/Contents/Info.plist" <<'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -267,6 +385,14 @@ jobs:
           /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $version" "$app/Contents/Info.plist"
           /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $version" "$app/Contents/Info.plist"
           pkgbuild --root "$pkgroot" --identifier "com.boaw.artinchip-flash" --version "$version" --install-location / "packages/artinchip-flash-${system}.pkg"
+          otool -L target/release/artinchip-flash | grep -F 'libusb-1.0.0.dylib'
+          pkgutil --expand-full "packages/artinchip-flash-${system}.pkg" verified-pkg
+          plutil -lint verified-pkg/Payload/Applications/artinchip-flash-gui.app/Contents/Info.plist
+          for file in LICENSE NOTICE THIRD-PARTY-LICENSES.txt; do
+            tar -xOf "packages/$archive" "./$file" | cmp "$file" -
+            cmp "$file" "verified-pkg/Payload/Applications/artinchip-flash-gui.app/Contents/Resources/$file"
+            cmp "$file" "verified-pkg/Payload/usr/local/share/doc/artinchip-flash/$file"
+          done
 
       - name: Upload packaged artifact
         uses: actions/upload-artifact@v4
@@ -279,7 +405,7 @@ jobs:
     name: publish-nightly
     runs-on: ubuntu-latest
     needs: build
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && !contains(github.event.head_commit.message, '[skip nightly]')
     permissions:
       contents: write
 

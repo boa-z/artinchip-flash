@@ -6,19 +6,19 @@ use std::sync::{
 };
 use std::time::Instant;
 
-use artinchip_flash::build_info;
-use artinchip_flash::burn_stats::{self, BurnOutcome};
-use artinchip_flash::device::{BurnEvent, BurnOptions, UpgDevice};
-use artinchip_flash::image;
-use artinchip_flash::official;
-use artinchip_flash::protocol::commands::FwcMeta;
-use artinchip_flash::sdcard;
-use artinchip_flash::services::{self, UartSpec};
-use artinchip_flash::standalone;
-use artinchip_flash::transport::UpgTransport;
-use artinchip_flash::update::{self, UpdateChannel};
-use artinchip_flash::usb;
-use artinchip_flash::verbosity;
+use artinchip_flash::{FirmwareImage, FlashError};
+use artinchip_flash_app::build_info;
+use artinchip_flash_app::burn_stats::{self, BurnOutcome};
+use artinchip_flash_app::device::{BurnEvent, BurnOptions, UpgDevice};
+use artinchip_flash_app::flash_job::{self, EraseRequest, FlashJob, JobError, JobEvent};
+use artinchip_flash_app::image;
+use artinchip_flash_app::sdcard;
+use artinchip_flash_app::services::{self, DeviceTarget, UartSpec};
+use artinchip_flash_app::standalone;
+use artinchip_flash_app::transport::UpgTransport;
+use artinchip_flash_app::update::{self, UpdateChannel};
+use artinchip_flash_app::usb;
+use artinchip_flash_app::verbosity;
 use clap::{Args, Parser, Subcommand};
 
 #[derive(Parser)]
@@ -37,6 +37,36 @@ struct Cli {
     json: bool,
     #[command(subcommand)]
     command: Commands,
+}
+
+#[cfg(test)]
+mod gui_parity_tests {
+    use super::Cli;
+    use clap::CommandFactory;
+
+    #[test]
+    fn every_cli_subcommand_has_one_documented_gui_entry() {
+        let matrices = [
+            ("en", include_str!("../docs/en/reference.md")),
+            ("zh-CN", include_str!("../docs/zh-CN/reference.md")),
+        ];
+        let command = Cli::command();
+        let names = command
+            .get_subcommands()
+            .map(|command| command.get_name())
+            .collect::<Vec<_>>();
+        assert_eq!(names.len(), 22);
+        for (locale, matrix) in matrices {
+            for name in &names {
+                let row = format!("| `{name}` |");
+                assert_eq!(
+                    matrix.lines().filter(|line| line.starts_with(&row)).count(),
+                    1,
+                    "{locale}: {name}"
+                );
+            }
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -79,7 +109,7 @@ enum Commands {
         #[arg(long)]
         no_updater: bool,
         /// Erase the whole chip via `upgcmd flasherase` before burning.
-        /// Needs --upgcmd-path (or the Windows default AiBurn install).
+        /// Requires a specific --device or --uart port and an installed upgcmd.
         #[arg(long)]
         erase_all: bool,
         /// Media id for --erase-all; defaults to the image media_dev_id
@@ -440,7 +470,7 @@ fn open_uart_shared(
     baud: u32,
     speed: Option<u32>,
     auto_enter: bool,
-) -> Result<artinchip_flash::uart::UartDevice, String> {
+) -> Result<artinchip_flash_app::uart::UartDevice, String> {
     services::open_uart(&UartSpec::new(port, baud, speed, auto_enter))
 }
 
@@ -451,7 +481,9 @@ fn open_uart_shared(
 fn default_upgcmd_path() -> PathBuf {
     #[cfg(windows)]
     {
-        artinchip_flash::app_config::compat_tool_path(std::path::Path::new(r"C:\ArtInChip\AiBurn"))
+        artinchip_flash_app::app_config::compat_tool_path(std::path::Path::new(
+            r"C:\ArtInChip\AiBurn",
+        ))
     }
     #[cfg(not(windows))]
     {
@@ -460,14 +492,14 @@ fn default_upgcmd_path() -> PathBuf {
 }
 
 fn cmd_uart_monitor(port: String, baud: u32, enter_upg: bool) {
-    if let Err(e) = artinchip_flash::uart::run_cli_monitor(&port, baud, enter_upg) {
+    if let Err(e) = artinchip_flash_app::uart::run_cli_monitor(&port, baud, enter_upg) {
         eprintln!("{}", e);
         std::process::exit(1);
     }
 }
 
 fn cmd_serial_list(json: bool) {
-    match artinchip_flash::uart::UartDevice::list_ports() {
+    match artinchip_flash_app::uart::UartDevice::list_ports() {
         Ok(ports) => {
             if json {
                 let items: Vec<serde_json::Value> = ports
@@ -590,6 +622,9 @@ fn cmd_scan(json: bool) {
                             "pid": format!("{:04x}", device.product_id),
                             "speed": device.speed,
                             "ready": device.ready,
+                            "enumerated": device.ready,
+                            "ioreg_ready": device.ioreg_ready,
+                            "protocol_ready": device.protocol_ready,
                             "status": device.status,
                         })
                     })
@@ -600,14 +635,24 @@ fn cmd_scan(json: bool) {
             println!("Detected {} ArtInChip device(s):", devices.len());
             for device in &devices {
                 println!(
-                    "  bus={} address={} path={} vid=0x{:04x} pid=0x{:04x} speed={} status={}",
+                    "  bus={} address={} path={} vid=0x{:04x} pid=0x{:04x} speed={} enumerated={} ioreg={} protocol={}",
                     device.bus_number,
                     device.address,
                     device.port_path,
                     device.vendor_id,
                     device.product_id,
                     device.speed,
-                    if device.ready { "ready" } else { "not-ready" }
+                    if device.ready { "yes" } else { "no" },
+                    match device.ioreg_ready {
+                        Some(true) => "ready",
+                        Some(false) => "not-ready",
+                        None => "unknown",
+                    },
+                    match device.protocol_ready {
+                        Some(true) => "ready",
+                        Some(false) => "failed",
+                        None => "unchecked",
+                    }
                 );
                 if let Some(status) = &device.status {
                     println!("    {}", status);
@@ -715,86 +760,56 @@ fn cmd_burn(flags: BurnFlags) {
         auto_enter,
         json,
     } = flags;
-    // 1. Read image file
-    let img_data = match fs::read(&image_path) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("Error reading '{}': {}", image_path.display(), e);
-            std::process::exit(1);
+    let image = FirmwareImage::open(&image_path).unwrap_or_else(|error| {
+        if matches!(error, FlashError::ImageIo { .. }) {
+            eprintln!("{error}");
+        } else {
+            eprintln!("Error parsing image: {error}");
         }
-    };
-
-    // 2. Parse image
-    let (header, metas, _payload) = match image::parser::parse_image(&img_data) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("Error parsing image: {}", e);
-            std::process::exit(1);
-        }
-    };
-
-    println!(
+        std::process::exit(1);
+    });
+    let summary = image.summary();
+    let image_description = format!(
         "Image: {} {} v{} ({} components, {} bytes total)",
-        header.platform_str(),
-        header.product_str(),
-        header.version_str(),
-        metas.len(),
-        img_data.len()
+        summary.platform,
+        summary.product,
+        summary.version,
+        summary.metas.len(),
+        summary.total_size
     );
+    if json {
+        eprintln!("{image_description}");
+    } else {
+        println!("{image_description}");
+    }
 
     if !partition.is_empty() && (erase_all || force_upgrade) {
         eprintln!("Error: --partition cannot be combined with --erase-all or --force-upgrade");
         std::process::exit(2);
     }
 
-    let selected_parts = if partition.is_empty() {
-        artinchip_flash::device::default_burn_parts(&metas)
-    } else {
-        partition.clone()
-    };
-    let plan_options = BurnOptions {
-        selected_parts,
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut options = BurnOptions {
         partition_upgrade: !partition.is_empty(),
         no_updater,
         force_upgrade,
         reset_after_burn: !no_reset && !force_upgrade,
-        ..Default::default()
+        cancel: Some(cancel.clone()),
+        ..image.default_options()
     };
-    let burn_plan = match artinchip_flash::device::plan_burn(&img_data, &metas, &plan_options) {
-        Ok(plan) => plan,
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(2);
-        }
-    };
+    if !partition.is_empty() {
+        options.selected_parts = partition;
+    }
+    let flash = flash_job::prepare(&image, options, erase_all).unwrap_or_else(|error| {
+        eprintln!("Error: {error}");
+        std::process::exit(2);
+    });
+    let burn_plan = flash.plan();
     if plan {
         if json {
-            let components: Vec<_> = burn_plan
-                .components
-                .iter()
-                .map(|component| {
-                    serde_json::json!({
-                        "kind": component.kind,
-                        "name": component.name,
-                        "partition": component.partition,
-                        "media": component.media,
-                        "size": component.size,
-                        "crc": format!("{:08x}", component.crc),
-                        "selected": component.selected,
-                    })
-                })
-                .collect();
-            println!(
-                "{}",
-                serde_json::json!({
-                    "mode": burn_plan.mode,
-                    "mode_name": burn_plan.mode_name(),
-                    "total_bytes": burn_plan.total_bytes,
-                    "components": components,
-                })
-            );
+            println!("{}", burn_plan.to_json());
         } else {
-            for line in artinchip_flash::device::format_plan_lines(&burn_plan) {
+            for line in artinchip_flash_app::device::format_plan_lines(burn_plan) {
                 println!("{}", line);
             }
         }
@@ -808,96 +823,42 @@ fn cmd_burn(flags: BurnFlags) {
         );
     }
 
-    // 2b. Optional pre-burn full-chip erase via the official backend.
-    // Native erase is not implemented (UPG erase command unconfirmed), so this
-    // reuses `upgcmd flasherase` *before* the native burn opens the device.
-    if erase_all {
-        let media = erase_media
-            .as_deref()
-            .map(str::trim)
-            .filter(|m| !m.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| header.media_dev_id().to_string());
-        let upgcmd = upgcmd_path.unwrap_or_else(default_upgcmd_path);
-        if upgcmd.as_os_str().is_empty() {
-            eprintln!(
-                "Error: --erase-all needs --upgcmd-path (no default upgcmd on this platform)"
-            );
-            std::process::exit(1);
-        }
-        let (erase_uart, erase_baud) = match (&uart, speed) {
-            (Some(port), _) if !port.eq_ignore_ascii_case("auto") => (
-                port.clone(),
-                speed.map(|b| b.to_string()).unwrap_or_default(),
-            ),
-            (Some(_), _) => (
-                String::new(),
-                speed.map(|b| b.to_string()).unwrap_or_default(),
-            ),
-            (None, _) => (String::new(), String::new()),
-        };
-        eprintln!("Erasing chip (flasherase media {}) ...", media);
-        match official::run_pre_burn_erase(
-            &upgcmd,
-            &media,
-            Some(&image_path),
-            "",
-            &erase_uart,
-            &erase_baud,
-        ) {
-            Ok(text) => {
-                for line in text.lines() {
-                    eprintln!("  [flasherase] {}", line);
-                }
+    let erase = erase_all.then(|| EraseRequest {
+        tool: upgcmd_path.unwrap_or_else(default_upgcmd_path),
+        media: erase_media,
+        image: Some(image_path.clone()),
+        uart_baudrate: uart.as_ref().and(speed),
+    });
+    let target = match uart.as_deref() {
+        Some(port) => DeviceTarget::Uart(UartSpec::new(port, baud, speed, auto_enter)),
+        None => match usb::device::DeviceSelector::parse(device.as_deref()) {
+            Ok(selector) => DeviceTarget::Usb(selector),
+            Err(error) => {
+                eprintln!("Burn failed: {error}");
+                std::process::exit(burn_error_exit_code(&error));
             }
-            Err(e) => {
-                eprintln!("Pre-burn erase failed, aborting burn: {}", e);
-                std::process::exit(1);
-            }
-        }
-    }
-
-    let cancel = Arc::new(AtomicBool::new(false));
-    {
-        let flag = cancel.clone();
-        // Ignore double-install errors (tests / nested calls).
-        let _ = ctrlc::set_handler(move || {
-            flag.store(true, Ordering::SeqCst);
-        });
-    }
-    let options = BurnOptions {
-        cancel: Some(cancel),
-        ..plan_options
+        },
     };
 
+    let _ = ctrlc::set_handler(move || cancel.store(true, Ordering::SeqCst));
     eprintln!("Press Ctrl+C to cancel the burn (aborts at the next chunk).");
     let started = Instant::now();
-    let mut log_lines: Vec<String> = Vec::new();
-    let result = if let Some(port) = uart {
-        open_uart_shared(&port, baud, speed, auto_enter).and_then(|dev| {
-            burn_with_device(
-                dev,
-                &img_data,
-                &metas,
-                &options,
-                json,
-                started,
-                &mut log_lines,
-            )
-        })
-    } else {
-        usb::device::AicDevice::open_selected(device.as_deref()).and_then(|dev| {
-            burn_with_device(
-                dev,
-                &img_data,
-                &metas,
-                &options,
-                json,
-                started,
-                &mut log_lines,
-            )
-        })
+    let mut log_lines = Vec::new();
+    let job = FlashJob {
+        flash: &flash,
+        target,
+        erase,
+        report_device_info: true,
     };
+    let result = job.run(|event| match event {
+        JobEvent::Output(line) if json => eprintln!("{line}"),
+        JobEvent::Output(line) => println!("{line}"),
+        JobEvent::Progress(event) => render_burn_event(event, json, started, &mut log_lines),
+    });
+    if let Err(JobError::PreErase(error)) = &result {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
 
     let elapsed = started.elapsed();
     if let Some(path) = &log_file {
@@ -910,7 +871,9 @@ fn cmd_burn(flags: BurnFlags) {
             }
         }
     }
-    if let Err(e) = result {
+    if let Err(error) = result {
+        let cancelled = matches!(error, JobError::Upgrade(FlashError::Cancelled));
+        let e = error.to_string();
         // Record the outcome for `stats` before exiting (best effort only;
         // a stats failure must not mask the burn result).
         let outcome = burn_stats::classify_error(&e);
@@ -918,7 +881,7 @@ fn cmd_burn(flags: BurnFlags) {
         if let Err(stat_err) = burn_stats::record(&app_dir, outcome) {
             eprintln!("Warning: could not record burn stats: {}", stat_err);
         }
-        if e.contains("cancelled") {
+        if cancelled {
             eprintln!(
                 "Burn cancelled after {:.1}s (device stays in upgrade mode; retry when ready).",
                 elapsed.as_secs_f64()
@@ -936,9 +899,11 @@ fn cmd_burn(flags: BurnFlags) {
     eprintln!(
         "Burn completed successfully in {:.1}s (avg {}).",
         elapsed.as_secs_f64(),
-        format_rate(img_data.len() as f64 / elapsed.as_secs_f64().max(0.001))
+        format_rate(summary.total_size as f64 / elapsed.as_secs_f64().max(0.001))
     );
-    println!("Burn completed successfully!");
+    if !json {
+        println!("Burn completed successfully!");
+    }
 }
 
 fn burn_error_exit_code(err: &str) -> i32 {
@@ -963,73 +928,51 @@ fn burn_error_exit_code(err: &str) -> i32 {
     }
 }
 
-fn burn_with_device<T: UpgTransport>(
-    mut dev: UpgDevice<T>,
-    img_data: &[u8],
-    metas: &[FwcMeta],
-    options: &BurnOptions,
-    json: bool,
-    started: Instant,
-    log_lines: &mut Vec<String>,
-) -> Result<(), String> {
-    println!("Transport: {}", dev.transport_name());
-    match dev.device_info_lines() {
-        Ok(lines) => {
-            for line in lines {
-                println!("  {}", line);
+fn render_burn_event(event: BurnEvent, json: bool, started: Instant, log_lines: &mut Vec<String>) {
+    let elapsed = started.elapsed();
+    if json {
+        let value = event.to_json(elapsed);
+        println!("{}", value);
+        log_lines.push(value.to_string());
+    } else {
+        let line = match event {
+            BurnEvent::Log(line) | BurnEvent::Stage(line) => line,
+            BurnEvent::ComponentStarted {
+                name,
+                partition,
+                size,
+            } => {
+                format!("Meta {} partition={} size={} ...", name, partition, size)
             }
-        }
-        Err(e) => eprintln!("Warning: could not read device info: {}", e),
-    }
-    // Library emits structured events; CLI renders them (previously the library
-    // printed directly, which GUI could not reuse).
-    let mut callback = |event: BurnEvent| {
-        let elapsed = started.elapsed();
-        if json {
-            let value = burn_event_json_timed(&event, elapsed);
-            println!("{}", value);
-            log_lines.push(value.to_string());
-        } else {
-            let line = match event {
-                BurnEvent::Log(line) | BurnEvent::Stage(line) => line,
-                BurnEvent::ComponentStarted {
+            BurnEvent::ComponentProgress { name, sent, total } => {
+                format!(
+                    "  {}: {}/{} ({:.1}%) {} {}",
                     name,
-                    partition,
-                    size,
-                } => {
-                    format!("Meta {} partition={} size={} ...", name, partition, size)
-                }
-                BurnEvent::ComponentProgress { name, sent, total } => {
-                    format!(
-                        "  {}: {}/{} ({:.1}%) {} {}",
-                        name,
-                        sent,
-                        total,
-                        services::progress_ratio(sent, total) * 100.0,
-                        format_rate(sent as f64 / elapsed.as_secs_f64().max(0.001)),
-                        format_elapsed(elapsed),
-                    )
-                }
-                BurnEvent::OverallProgress { sent, total } => {
-                    format!(
-                        "  Overall: {}/{} ({:.1}%) {} {}",
-                        sent,
-                        total,
-                        services::progress_ratio(sent, total) * 100.0,
-                        format_rate(sent as f64 / elapsed.as_secs_f64().max(0.001)),
-                        format_elapsed(elapsed),
-                    )
-                }
-                BurnEvent::ComponentFinished { name } => {
-                    format!("Component done: {}", name)
-                }
-                BurnEvent::Finished => format!("Burn finished {}", format_elapsed(elapsed)),
-            };
-            eprintln!("{}", line);
-            log_lines.push(line);
-        }
-    };
-    dev.burn_image_with_options(img_data, metas, options, Some(&mut callback))
+                    sent,
+                    total,
+                    services::progress_ratio(sent, total) * 100.0,
+                    format_rate(sent as f64 / elapsed.as_secs_f64().max(0.001)),
+                    format_elapsed(elapsed),
+                )
+            }
+            BurnEvent::OverallProgress { sent, total } => {
+                format!(
+                    "  Overall: {}/{} ({:.1}%) {} {}",
+                    sent,
+                    total,
+                    services::progress_ratio(sent, total) * 100.0,
+                    format_rate(sent as f64 / elapsed.as_secs_f64().max(0.001)),
+                    format_elapsed(elapsed),
+                )
+            }
+            BurnEvent::ComponentFinished { name } => {
+                format!("Component done: {}", name)
+            }
+            BurnEvent::Finished => format!("Burn finished {}", format_elapsed(elapsed)),
+        };
+        eprintln!("{}", line);
+        log_lines.push(line);
+    }
 }
 
 fn format_rate(bps: f64) -> String {
@@ -1053,47 +996,6 @@ fn format_elapsed(elapsed: std::time::Duration) -> String {
         elapsed.as_secs() / 60,
         elapsed.as_secs() % 60
     )
-}
-
-#[allow(dead_code)]
-fn burn_event_json(event: &BurnEvent) -> serde_json::Value {
-    burn_event_json_timed(event, std::time::Duration::ZERO)
-}
-
-fn burn_event_json_timed(event: &BurnEvent, elapsed: std::time::Duration) -> serde_json::Value {
-    let elapsed_secs = elapsed.as_secs_f64();
-    match event {
-        BurnEvent::Log(line) => {
-            serde_json::json!({ "type": "log", "line": line, "elapsed_secs": elapsed_secs })
-        }
-        BurnEvent::Stage(line) => {
-            serde_json::json!({ "type": "stage", "line": line, "elapsed_secs": elapsed_secs })
-        }
-        BurnEvent::ComponentStarted {
-            name,
-            partition,
-            size,
-        } => {
-            serde_json::json!({ "type": "component_started", "name": name, "partition": partition, "size": size, "elapsed_secs": elapsed_secs })
-        }
-        BurnEvent::ComponentProgress { name, sent, total } => {
-            serde_json::json!({ "type": "component_progress", "name": name, "sent": sent, "total": total, "elapsed_secs": elapsed_secs, "rate_bps": rate_bps(*sent, elapsed) })
-        }
-        BurnEvent::OverallProgress { sent, total } => {
-            serde_json::json!({ "type": "overall_progress", "sent": sent, "total": total, "elapsed_secs": elapsed_secs, "rate_bps": rate_bps(*sent, elapsed) })
-        }
-        BurnEvent::ComponentFinished { name } => {
-            serde_json::json!({ "type": "component_finished", "name": name, "elapsed_secs": elapsed_secs })
-        }
-        BurnEvent::Finished => {
-            serde_json::json!({ "type": "finished", "elapsed_secs": elapsed_secs })
-        }
-    }
-}
-
-fn rate_bps(sent: usize, elapsed: std::time::Duration) -> f64 {
-    let secs = elapsed.as_secs_f64().max(0.001);
-    sent as f64 / secs
 }
 
 /// Run `f` against an opened native device; print the error and exit 1.

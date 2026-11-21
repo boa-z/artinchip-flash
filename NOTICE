@@ -1,0 +1,9 @@
+artinchip-flash
+
+The protocol and image implementations use ArtInChip's published Luban-Lite
+UPG interfaces as references. The Luban-Lite UPG headers and bootloader
+sources retain their upstream copyright and license notices.
+
+Binary distributions include a THIRD-PARTY-LICENSES.txt manifest for the
+Rust dependency graph and bundled assets. Windows distributions also
+include the libusb DLL and its corresponding source archive.

@@ -10,7 +10,33 @@ use crate::device::UpgDevice;
 use crate::image::parser::{self, ImageSummary};
 use crate::transport::UpgTransport;
 use crate::uart::{UartDevice, UartOptions};
-use crate::usb::device::AicDevice;
+use crate::usb::device::{AicDevice, DeviceSelector};
+
+#[derive(Clone, Debug)]
+pub enum DeviceTarget {
+    Usb(DeviceSelector),
+    Uart(UartSpec),
+}
+
+impl DeviceTarget {
+    pub fn open(&self) -> Result<UpgDevice<Box<dyn UpgTransport>>, String> {
+        match self {
+            Self::Usb(selector) => Ok(AicDevice::open_selector(selector.clone())?.into_boxed()),
+            Self::Uart(spec) => Ok(open_uart(spec)?.into_boxed()),
+        }
+    }
+
+    pub fn label(&self) -> String {
+        match self {
+            Self::Usb(DeviceSelector::PhysicalPort(bus, path)) => format!("USB {bus}:{path}"),
+            Self::Usb(selector) => format!("USB {selector:?}"),
+            Self::Uart(spec) => format!(
+                "UART {} @ {}, speed={:?}, auto-enter={}",
+                spec.port, spec.baud, spec.speed, spec.auto_enter
+            ),
+        }
+    }
+}
 
 /// How the caller wants to reach the device over UART.
 #[derive(Clone, Debug)]
@@ -62,11 +88,10 @@ pub fn open_native_device(
     speed: Option<u32>,
     auto_enter: bool,
 ) -> Result<UpgDevice<Box<dyn UpgTransport>>, String> {
-    if let Some(port) = uart {
-        Ok(open_uart(&UartSpec::new(port, baud, speed, auto_enter))?.into_boxed())
-    } else {
-        Ok(AicDevice::open_first()?.into_boxed())
-    }
+    uart.map_or(DeviceTarget::Usb(DeviceSelector::Unique), |port| {
+        DeviceTarget::Uart(UartSpec::new(port, baud, speed, auto_enter))
+    })
+    .open()
 }
 
 /// Parse a user-supplied integer: `0x`-prefixed hex, decimal, or decimal

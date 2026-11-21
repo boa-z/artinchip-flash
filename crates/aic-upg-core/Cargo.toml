@@ -1,0 +1,12 @@
+[package]
+name = "aic-upg-core"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.95"
+description = "Transport-independent ArtInChip firmware image and UPG protocol engine"
+repository = "https://github.com/boa-z/artinchip-flash"
+license = "Apache-2.0"
+
+[dependencies]
+crc32fast = "1"
+serde_json = "1"

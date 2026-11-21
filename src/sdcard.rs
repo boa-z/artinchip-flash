@@ -2,16 +2,15 @@
 //!
 //! Official AiBurn's "制作启动卡" page enumerates SD/MMC disks, writes a
 //! GPT/MBR layout, formats, and writes the MMC image — all requiring
-//! administrator rights. Raw-disk writing is intentionally **not** implemented
-//! here (Windows `\\.\PhysicalDriveN` + GPT work is tracked in
-//! `docs/启动卡设计.md`); this module only provides the safe read-only half:
-//! list the physical disks so users can confirm the target before using the
-//! official tool.
+//! administrator rights. This module provides read-only disk discovery so
+//! users can confirm the target before using the official tool. See
+//! `docs/en/reference.md` for the compatibility limits.
 //!
 //! No new dependencies: Linux reads `/sys/block`, Windows shells out to
 //! PowerShell `Get-Disk` (CSV) with a `wmic` fallback, macOS parses
 //! `diskutil list`. All parsers are pure functions covered by unit tests.
 
+#[cfg(any(windows, target_os = "macos"))]
 use std::process::Command;
 
 #[cfg(any(target_os = "linux", test))]

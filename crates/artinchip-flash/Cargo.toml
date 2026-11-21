@@ -1,0 +1,19 @@
+[package]
+name = "artinchip-flash"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.95"
+description = "Rust SDK for ArtInChip firmware upgrades and device diagnostics"
+repository = "https://github.com/boa-z/artinchip-flash"
+license = "Apache-2.0"
+
+[features]
+default = ["usb", "uart"]
+usb = ["dep:rusb", "dep:fs2"]
+uart = ["dep:serialport"]
+
+[dependencies]
+aic-upg-core = { path = "../aic-upg-core", version = "0.2.0" }
+fs2 = { version = "0.4", optional = true }
+rusb = { version = "0.9", optional = true }
+serialport = { version = "4", optional = true }

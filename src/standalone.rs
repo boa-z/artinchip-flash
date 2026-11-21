@@ -59,39 +59,7 @@ fn legacy_app_dir() -> PathBuf {
     app_dir_for(LEGACY_APP_NAME)
 }
 
-fn app_dir_for(app_name: &str) -> PathBuf {
-    #[cfg(windows)]
-    {
-        if let Some(appdata) = std::env::var_os("APPDATA") {
-            return PathBuf::from(appdata).join(app_name);
-        }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        if let Some(home) = home_dir() {
-            return home
-                .join("Library")
-                .join("Application Support")
-                .join(app_name);
-        }
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
-            return PathBuf::from(xdg).join(app_name);
-        }
-        if let Some(home) = home_dir() {
-            return home.join(".config").join(app_name);
-        }
-    }
-    if let Some(appdata) = std::env::var_os("APPDATA") {
-        return PathBuf::from(appdata).join(app_name);
-    }
-    if let Some(home) = std::env::var_os("USERPROFILE") {
-        return PathBuf::from(home).join(format!(".{app_name}"));
-    }
-    PathBuf::from(format!(".{app_name}"))
-}
+use artinchip_flash::paths::config_dir as app_dir_for;
 
 pub fn migrate_legacy_app_data() -> Result<(), String> {
     let source = legacy_app_dir();
@@ -121,13 +89,6 @@ pub fn migrate_legacy_app_data() -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-#[cfg(any(unix, target_os = "macos"))]
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
 }
 
 pub fn ensure_app_dir() -> Result<PathBuf, String> {
@@ -172,27 +133,30 @@ pub fn environment_report(image: Option<&Path>) -> String {
             lines.push(format!("USB device: {} detected", devices.len()));
             for device in &devices {
                 lines.push(format!(
-                    "  bus={} address={} path={} speed={} status={}",
+                    "  bus={} address={} path={} speed={} enumerated={} ioreg={} protocol={}",
                     device.bus_number,
                     device.address,
                     device.port_path,
                     device.speed,
-                    if device.ready { "ready" } else { "not-ready" }
+                    if device.ready { "yes" } else { "no" },
+                    match device.ioreg_ready {
+                        Some(true) => "ready",
+                        Some(false) => "not-ready",
+                        None => "unknown",
+                    },
+                    match device.protocol_ready {
+                        Some(true) => "ready",
+                        Some(false) => "failed",
+                        None => "unchecked",
+                    }
                 ));
                 if let Some(status) = &device.status {
                     lines.push(format!("    {}", status));
                 }
             }
-            if devices.iter().any(|device| device.ready) {
-                match AicDevice::open_first() {
-                    Ok(_) => lines.push("USB access: OK".to_string()),
-                    Err(e) => lines.push(format!("USB access: FAILED ({})", e)),
-                }
-            } else {
-                lines.push(
-                    "USB access: SKIPPED (device detected but not ready for USB transfers)"
-                        .to_string(),
-                );
+            match AicDevice::open_first() {
+                Ok(_) => lines.push("USB access: OK".to_string()),
+                Err(e) => lines.push(format!("USB access: FAILED ({})", e)),
             }
         }
         Err(e) => lines.push(format!("USB scan: FAILED ({})", e)),

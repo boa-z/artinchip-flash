@@ -419,8 +419,7 @@ pub fn run_upgcmd(upgcmd: &Path, args: &[String]) -> Result<String, String> {
 }
 
 pub fn run_adb_enter_upgrade(aiburn_dir: &Path) -> Result<String, String> {
-    let adb = adb_path(aiburn_dir)?;
-    run_program_capture(&adb, &["shell", "aicupg"])
+    crate::adb::enter_upgrade(None, aiburn_dir)
 }
 
 pub fn open_manual(aiburn_dir: &Path) -> Result<(), String> {
@@ -466,56 +465,9 @@ pub fn open_manual(aiburn_dir: &Path) -> Result<(), String> {
     }
 }
 
-fn adb_path(aiburn_dir: &Path) -> Result<PathBuf, String> {
-    let bundled = if cfg!(windows) {
-        aiburn_dir.join("adb").join("adb.exe")
-    } else {
-        aiburn_dir.join("adb").join("adb")
-    };
-    if bundled.exists() {
-        return Ok(bundled);
-    }
-    find_in_path(if cfg!(windows) { "adb.exe" } else { "adb" })
-        .ok_or_else(|| "adb not found in compatibility directory or PATH".to_string())
-}
-
-fn find_in_path(name: &str) -> Option<PathBuf> {
-    let paths = std::env::var_os("PATH")?;
-    std::env::split_paths(&paths)
-        .map(|dir| dir.join(name))
-        .find(|candidate| candidate.exists())
-}
-
 fn required_path(path: Option<&Path>, label: &str) -> Result<String, String> {
     path.map(path_arg)
         .ok_or_else(|| format!("Missing {}", label))
-}
-
-fn run_program_capture(path: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new(path)
-        .args(args)
-        .output()
-        .map_err(|e| format!("Failed to run '{}': {}", path.display(), e))?;
-    let mut text = String::new();
-    if !output.stdout.is_empty() {
-        text.push_str(&String::from_utf8_lossy(&output.stdout));
-    }
-    if !output.stderr.is_empty() {
-        if !text.is_empty() && !text.ends_with('\n') {
-            text.push('\n');
-        }
-        text.push_str(&String::from_utf8_lossy(&output.stderr));
-    }
-    if output.status.success() {
-        Ok(text)
-    } else {
-        Err(format!(
-            "{} exited with {}:\n{}",
-            path.display(),
-            output.status,
-            text.trim_end()
-        ))
-    }
 }
 
 fn required_text(value: &str, label: &str) -> Result<String, String> {
@@ -562,7 +514,7 @@ fn split_raw_args(args: &str) -> Vec<String> {
 /// Build the `upgcmd flasherase` argument list for the pre-burn erase stage.
 ///
 /// Native full-chip erase is not implemented (the UPG erase command is not
-/// reverse-engineered; see docs/与AiBurn功能对照.md): the burn frontends run
+/// reverse-engineered; see docs/en/reference.md): the burn frontends run
 /// this official backend *before* opening the device natively. Transport
 /// selectors use the same `upgcmd -d/-u/-b`透传 as [`build_args`]; empty
 /// strings mean "default". `media` is required by `flasherase`; callers fall
