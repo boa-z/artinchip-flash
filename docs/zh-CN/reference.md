@@ -2,6 +2,16 @@
 
 [文档目录](README.md) · [English](../en/reference.md)
 
+## macOS D213 BROM USB
+
+**已知兼容性问题。** 在已测试的 Apple Silicon macOS 环境中，ArtInChip D213 进入 Boot ROM（阶段 0，VID:PID `33C3:6677`）后，当前无法原生 USB 烧录。以下观察来自已测试的开发板和 USB 拓扑。
+
+- **macOS 枚举。** 在 macOS 27.0.1 上，系统可见 `IOUSBHostDevice`，也能读取设备描述符，但没有活动配置或 USB 接口。在 macOS 27.2.1 上，枚举期间出现 Babble（`0xe00002e8`），随后 STRING 和 CONFIG 读取超时（`0xe00002d6`）。Configuration 1 及其 Bulk 端点（IN `0x81`、OUT `0x02`）仍不可用，应用可能显示 `LIBUSB_ERROR_OTHER (-99)`。通过 IOUSBHost DeviceCapture 成功接管设备后，读取配置描述符的前 9 字节仍然超时。
+- **Windows 对照。** 已验证可用的 Windows USB 路径通过 ArtInChip INF 绑定微软的 `WinUSB.sys`。`GET_DESCRIPTOR(STRING1, wLength=2)` 触发 `USBD_STATUS_BABBLE_DETECTED`（`0xC0000012`）。随后 Windows USBXHCI 对 EP0 成功执行 `Reset Endpoint` 和 `Set TR Dequeue Pointer` 两条主机控制器命令，同一 WinUSB 句柄紧接着读到配置描述符的前 9 字节。macOS 上触发 Babble 的具体事务仍待确认。
+- **DriverKit 调查。** 设备级驱动通过无签名构建。Xcode 确认 Personal Team 无法签发所需 profile，宿主需要 System Extension 能力，驱动需要 DriverKit 和 USB Transport 能力。驱动激活和真机行为仍待验证。公开 USBDriverKit API 没有控制首次描述符读取顺序或发出上述 xHCI EP0 恢复命令的受支持入口。
+
+如果板卡只能进入 BROM，将 USB 接到已验证可用的 Windows 或 Linux 主机。如果板卡仍能运行启用了 AICUPG UART 的 U-Boot，可以在 macOS 上使用该 Bootloader 阶段的[串口升级流程](usage.md#串口烧录)。
+
 ## CLI 与 GUI 入口
 
 用 `artinchip-flash <command> --help` 查看参数和选项。GUI 与 CLI 使用同一组 Rust 服务。诊断结果可复制或导出为 JSON。需要导出烧录事件时，在烧录前通过「高级选项」启用 JSON 记录，完成后在「工具」或「设置」中打开「最近一次结构化结果」。

@@ -2,6 +2,16 @@
 
 [Documentation](README.md) · [简体中文](../zh-CN/reference.md)
 
+## macOS D213 BROM USB
+
+**Known compatibility issue.** Native USB flashing of the ArtInChip D213 in Boot ROM (stage 0, VID:PID `33C3:6677`) is unavailable on the tested Apple Silicon macOS setup. The observations below come from the tested board and USB topology.
+
+- **macOS enumeration.** On macOS 27.0.1, the device appeared as `IOUSBHostDevice` and returned its device descriptor. No active configuration or USB interfaces appeared. On macOS 27.2.1, enumeration encountered Babble (`0xe00002e8`), followed by STRING and CONFIG timeouts (`0xe00002d6`). Configuration 1 and its bulk endpoints (`0x81` IN, `0x02` OUT) remained unavailable. The application can report `LIBUSB_ERROR_OTHER (-99)` for this failure. Reading the first nine bytes of the configuration descriptor still timed out after the host acquired the device through IOUSBHost DeviceCapture.
+- **Windows comparison.** The working USB path uses Microsoft's `WinUSB.sys` via the ArtInChip INF. `GET_DESCRIPTOR(STRING1, wLength=2)` produced `USBD_STATUS_BABBLE_DETECTED` (`0xC0000012`). Windows USBXHCI then completed two host-controller commands for EP0, `Reset Endpoint` and `Set TR Dequeue Pointer`. The same WinUSB handle subsequently read the first nine bytes of the configuration descriptor successfully. The exact transaction that triggered Babble on macOS remains unconfirmed.
+- **DriverKit investigation.** The unsigned device-level driver built successfully. Xcode rejected provisioning with a Personal Team because the host requires System Extension capability and the driver requires DriverKit and USB Transport capabilities. Activation and device behavior remain unverified. Public USBDriverKit APIs expose no documented way to control initial descriptor ordering or issue the xHCI EP0 recovery commands observed on Windows.
+
+For a board that can enter only BROM, connect its USB cable to a known-working Windows or Linux host. If the board can still boot a U-Boot build with AICUPG UART enabled, macOS can use the project's [UART upgrade path](usage.md#flashing-over-uart) for that bootloader stage.
+
 ## CLI and GUI entry points
 
 Use `artinchip-flash <command> --help` for arguments and options. The GUI calls the same Rust services as the CLI. Diagnostic results can be copied or exported as JSON. To export burn events, enable JSON capture in **Advanced options** before burning, then open **Latest structured result** in Tools or Settings.

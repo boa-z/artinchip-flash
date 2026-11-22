@@ -10,6 +10,9 @@ On Windows, **Tools → Driver** or `artinchip-flash install-usb-access` can ins
 
 ## Flashing over USB
 
+> [!IMPORTANT]
+> D213 Boot ROM USB flashing (`33C3:6677`) is unavailable on the tested Apple Silicon macOS setup. Seeing the device in `scan` or the USB registry does not establish bulk access. Use a known-working Windows or Linux host for BROM recovery. If U-Boot is still available and has AICUPG UART enabled, use [UART flashing](#flashing-over-uart). See the [macOS compatibility findings](reference.md#macos-d213-brom-usb).
+
 Enter upgrade mode using the board's documented procedure. For a running system with the ArtInChip console, `aicupg gotobl` requests bootloader upgrade mode. Scanning selects a sole ArtInChip USB device. With multiple boards, select an explicit physical port. The application uses the same port after re-enumeration.
 
 ```sh

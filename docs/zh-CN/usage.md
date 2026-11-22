@@ -10,6 +10,9 @@ Windows 下使用「工具 → 驱动」或 `artinchip-flash install-usb-access`
 
 ## USB 烧录
 
+> [!IMPORTANT]
+> 已测试的 Apple Silicon macOS 环境无法通过 USB 烧录处于 BROM 的 D213（`33C3:6677`）。`scan` 或 USB 注册表中看到设备时，仍可能没有可用的 Bulk 接口。BROM 恢复请使用已验证可用的 Windows 或 Linux 主机。如果板卡仍能进入启用了 AICUPG UART 的 U-Boot，可用[串口烧录](#串口烧录)。参见 [macOS 兼容性研究结果](reference.md#macos-d213-brom-usb)。
+
 按开发板手册进入升级模式。系统已运行且提供 ArtInChip 控制台时，可用 `aicupg gotobl` 请求进入 Bootloader 升级模式。扫描到唯一 ArtInChip USB 设备时会自动选中。有多台设备时，明确选择物理端口。设备重新枚举后会按同一端口重连。
 
 ```sh

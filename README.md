@@ -4,6 +4,9 @@
 
 Cross-platform CLI and egui GUI for flashing ArtInChip SoCs over USB or UART, with a Rust SDK for firmware inspection, upgrade plans and device operations.
 
+> [!IMPORTANT]
+> **Known macOS compatibility issue.** Native USB flashing of the D213 in Boot ROM (BROM, `33C3:6677`) is unavailable on the tested Apple Silicon macOS setup. The device can appear in the USB registry while configuration and bulk access fail. Use a known-working Windows or Linux host for BROM recovery. [Research findings](docs/en/reference.md#macos-d213-brom-usb) · [简体中文](docs/zh-CN/reference.md#macos-d213-brom-usb)
+
 ## Quick start
 
 Download a package from [GitHub Releases](https://github.com/boa-z/artinchip-flash/releases), or build the CLI and GUI with the repository's pinned Rust toolchain. See the [build prerequisites](docs/en/development.md#build).
