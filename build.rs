@@ -3,7 +3,20 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/index");
+    println!("cargo:rerun-if-env-changed=ARTINCHIP_FLASH_CHANNEL");
     println!("cargo:rerun-if-changed=assets/artinchip-flash.ico");
+    for path in [
+        "Cargo.toml",
+        "Cargo.lock",
+        ".github",
+        "crates",
+        "docs",
+        "scripts",
+        "src",
+        "tests",
+    ] {
+        println!("cargo:rerun-if-changed={path}");
+    }
 
     #[cfg(windows)]
     {
@@ -17,6 +30,9 @@ fn main() {
     let commit =
         git_output(&["rev-parse", "--short=12", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
     let full_commit = git_output(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
+    if let Some(reference) = git_output(&["symbolic-ref", "-q", "HEAD"]) {
+        println!("cargo:rerun-if-changed=.git/{reference}");
+    }
     let dirty = Command::new("git")
         .args([
             "diff",
@@ -27,9 +43,8 @@ fn main() {
             ".",
             ":(exclude)tools",
         ])
-        .status()
-        .map(|status| !status.success())
-        .unwrap_or(false);
+        .output()
+        .is_ok_and(|output| output.status.code() == Some(1));
     let build = if dirty {
         format!("{}-dirty", commit)
     } else {
@@ -38,6 +53,16 @@ fn main() {
 
     println!("cargo:rustc-env=ARTINCHIP_FLASH_BUILD={}", build);
     println!("cargo:rustc-env=ARTINCHIP_FLASH_COMMIT={}", full_commit);
+    let channel = std::env::var("ARTINCHIP_FLASH_CHANNEL").unwrap_or_else(|_| "development".into());
+    assert!(matches!(
+        channel.as_str(),
+        "development" | "stable" | "nightly"
+    ));
+    println!("cargo:rustc-env=ARTINCHIP_FLASH_BUILD_CHANNEL={channel}");
+    println!(
+        "cargo:rustc-env=ARTINCHIP_FLASH_TARGET={}",
+        std::env::var("TARGET").unwrap()
+    );
 }
 
 fn git_output(args: &[&str]) -> Option<String> {

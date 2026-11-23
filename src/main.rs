@@ -4,13 +4,12 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use std::time::Instant;
 
 use artinchip_flash::{FirmwareImage, FlashError};
 use artinchip_flash_app::build_info;
 use artinchip_flash_app::burn_stats::{self, BurnOutcome};
-use artinchip_flash_app::device::{BurnEvent, BurnOptions, UpgDevice};
-use artinchip_flash_app::flash_job::{self, EraseRequest, FlashJob, JobError, JobEvent};
+use artinchip_flash_app::device::{BurnOptions, BurnReport, UpgDevice};
+use artinchip_flash_app::flash_job::{self, EraseRequest, FlashJob, JobError};
 use artinchip_flash_app::image;
 use artinchip_flash_app::sdcard;
 use artinchip_flash_app::services::{self, DeviceTarget, UartSpec};
@@ -19,7 +18,11 @@ use artinchip_flash_app::transport::UpgTransport;
 use artinchip_flash_app::update::{self, UpdateChannel};
 use artinchip_flash_app::usb;
 use artinchip_flash_app::verbosity;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+
+#[path = "cli/burn_output.rs"]
+mod burn_output;
+use burn_output::BurnOutput;
 
 #[derive(Parser)]
 #[command(
@@ -32,7 +35,7 @@ struct Cli {
     /// Verbose transport-level logging (CBW/CSW bytes, UART framing)
     #[arg(long, global = true)]
     verbose: bool,
-    /// Machine-readable JSON output (scan, usb-list, serial-list, stats, sd-list, update)
+    /// Machine-readable output (scan, usb-list, serial-list, info, env-check, burn, stats, sd-list, update)
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]
@@ -42,7 +45,7 @@ struct Cli {
 #[cfg(test)]
 mod gui_parity_tests {
     use super::Cli;
-    use clap::CommandFactory;
+    use clap::{error::ErrorKind, CommandFactory, Parser};
 
     #[test]
     fn every_cli_subcommand_has_one_documented_gui_entry() {
@@ -56,15 +59,60 @@ mod gui_parity_tests {
             .map(|command| command.get_name())
             .collect::<Vec<_>>();
         assert_eq!(names.len(), 22);
+        for name in &names {
+            let result = Cli::command().try_get_matches_from(["artinchip-flash", name, "--help"]);
+            assert_eq!(result.unwrap_err().kind(), ErrorKind::DisplayHelp, "{name}");
+        }
         for (locale, matrix) in matrices {
+            let entries = matrix
+                .lines()
+                .skip_while(|line| !line.starts_with("| CLI |"))
+                .take_while(|line| line.starts_with('|'))
+                .collect::<Vec<_>>();
             for name in &names {
                 let row = format!("| `{name}` |");
                 assert_eq!(
-                    matrix.lines().filter(|line| line.starts_with(&row)).count(),
+                    entries.iter().filter(|line| line.starts_with(&row)).count(),
                     1,
                     "{locale}: {name}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn all_subcommands_accept_their_documented_arguments() {
+        for command in [
+            "scan --require-device",
+            "usb-list --json",
+            "serial-list --json",
+            "burn image.img --plan --uart COM4 --baud 115200",
+            "info image.img",
+            "uart-monitor /dev/cu.serial",
+            "env-check image.img",
+            "install-usb-access",
+            "write 0x41000000 payload.bin --device 9-2",
+            "read 0x41000000 8 dump.bin",
+            "writel 0x41000000 1",
+            "readl 0x41000000 --uart /dev/ttyUSB0",
+            "exec 0x41000000",
+            "hexdump 0x41000000 16",
+            "fill 0x41000000 16 0xff",
+            "clear 0x41000000 16",
+            "memtest 0x41000000 16",
+            "shcmd version",
+            "log --device 1:2",
+            "stats",
+            "sd-list",
+            "update --channel nightly",
+        ] {
+            assert!(
+                Cli::try_parse_from(
+                    std::iter::once("artinchip-flash").chain(command.split_whitespace())
+                )
+                .is_ok(),
+                "{command}"
+            );
         }
     }
 }
@@ -72,7 +120,11 @@ mod gui_parity_tests {
 #[derive(Subcommand)]
 enum Commands {
     /// Scan for connected ArtInChip USB devices
-    Scan,
+    Scan {
+        /// Return exit code 3 if the result is empty
+        #[arg(long)]
+        require_device: bool,
+    },
     /// List all USB devices visible through libusb
     UsbList,
     /// List serial ports that can be used for UART firmware updates
@@ -102,9 +154,6 @@ enum Commands {
         /// Print the validated burn plan and exit without touching a device
         #[arg(long)]
         plan: bool,
-        /// USB device selector: physical port path (9-2) or bus:address (1:45)
-        #[arg(long, value_name = "SELECTOR")]
-        device: Option<String>,
         /// Skip updater components (device already in bootloader upgrade mode)
         #[arg(long)]
         no_updater: bool,
@@ -121,50 +170,23 @@ enum Commands {
         /// Save the burn event log to a file (in addition to console output)
         #[arg(long, value_name = "PATH")]
         log_file: Option<PathBuf>,
-        /// Update over UART: port name, or "auto" to probe every serial port
-        #[arg(
-            long,
-            value_name = "PORT",
-            num_args = 0..=1,
-            default_missing_value = "auto"
-        )]
-        uart: Option<String>,
-        /// Initial UART baudrate used to reach the bootloader
-        #[arg(long, default_value_t = 115200)]
-        baud: u32,
-        /// Negotiate a higher UART baudrate before burning (SET_UART_ARGS)
-        #[arg(long, value_name = "BAUD")]
-        speed: Option<u32>,
-        /// Do not try to trigger UART upgrade mode when the protocol does not answer
-        #[arg(long)]
-        no_enter_upg: bool,
+        /// Console progress style (JSON output always uses NDJSON)
+        #[arg(long, value_enum, default_value = "auto")]
+        progress: ProgressMode,
+        #[command(flatten)]
+        transport: TransportArgs,
     },
     /// Show device information, or parse an .img file
     Info {
         /// Optional .img file to parse instead of querying a device
-        #[arg(value_name = "IMAGE")]
+        #[arg(value_name = "IMAGE", conflicts_with_all = ["device", "uart"])]
         image: Option<PathBuf>,
-        /// Query over UART: port name, or "auto" to probe every serial port
-        #[arg(
-            long,
-            value_name = "PORT",
-            num_args = 0..=1,
-            default_missing_value = "auto"
-        )]
-        uart: Option<String>,
-        /// Initial UART baudrate used to reach the bootloader
-        #[arg(long, default_value_t = 115200)]
-        baud: u32,
-        /// Negotiate a higher UART baudrate before reading device info
-        #[arg(long, value_name = "BAUD")]
-        speed: Option<u32>,
-        /// Do not try to trigger UART upgrade mode when the protocol does not answer
-        #[arg(long)]
-        no_enter_upg: bool,
+        #[command(flatten)]
+        transport: TransportArgs,
     },
     /// Interactive UART monitor: view device output and send console commands
     UartMonitor {
-        /// Serial port, or "auto" to use the first USB serial port
+        /// Serial port, or "auto" to use the only USB serial port (or only serial port)
         #[arg(value_name = "PORT", default_value = "auto")]
         port: String,
         /// Baudrate of the device console
@@ -317,7 +339,7 @@ enum Commands {
     /// Check for updates from GitHub Releases
     Update {
         /// Update channel: stable (default, semver `v*` releases) or nightly
-        #[arg(long, default_value = "stable")]
+        #[arg(long, default_value = "stable", value_parser = ["stable", "nightly"], ignore_case = true)]
         channel: String,
         /// Open the release page in the default browser when an update exists
         #[arg(long)]
@@ -325,10 +347,20 @@ enum Commands {
     },
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ProgressMode {
+    Auto,
+    Plain,
+    Off,
+}
+
 /// Transport selectors shared by every native device command (USB default,
 /// UART opt-in with the same flags as `burn`/`info`).
 #[derive(Args, Clone, Debug)]
 struct TransportArgs {
+    /// Select a USB physical port path (9-2) or a bus:address pair (1:45)
+    #[arg(long, value_name = "SELECTOR", conflicts_with = "uart")]
+    device: Option<String>,
     /// Query over UART: port name, or "auto" to probe every serial port
     #[arg(
         long,
@@ -338,74 +370,107 @@ struct TransportArgs {
     )]
     uart: Option<String>,
     /// Initial UART baudrate used to reach the bootloader
-    #[arg(long, default_value_t = 115200)]
+    #[arg(long, default_value_t = 115200, value_parser = clap::value_parser!(u32).range(1..), requires = "uart")]
     baud: u32,
     /// Negotiate a higher UART baudrate before the command
-    #[arg(long, value_name = "BAUD")]
+    #[arg(long, value_name = "BAUD", value_parser = clap::value_parser!(u32).range(1..), requires = "uart")]
     speed: Option<u32>,
     /// Do not try to trigger UART upgrade mode when the protocol does not answer
-    #[arg(long)]
+    #[arg(long, requires = "uart")]
     no_enter_upg: bool,
 }
 
 impl TransportArgs {
-    fn open(&self) -> Result<UpgDevice<Box<dyn UpgTransport>>, String> {
-        services::open_native_device(
-            self.uart.as_deref(),
-            self.baud,
-            self.speed,
-            !self.no_enter_upg,
-        )
+    fn target(&self) -> Result<DeviceTarget, String> {
+        if let Some(port) = &self.uart {
+            if port.trim().is_empty() || self.speed.is_some_and(|speed| speed < self.baud) {
+                return Err(
+                    "Specify a nonempty UART port and a speed at least as high as --baud".into(),
+                );
+            }
+            Ok(DeviceTarget::Uart(UartSpec::new(
+                port.trim(),
+                self.baud,
+                self.speed,
+                !self.no_enter_upg,
+            )))
+        } else {
+            if self
+                .device
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                return Err(
+                    "USB selector is empty. Use a port path or bus:address from scan.".into(),
+                );
+            }
+            let selector = usb::device::DeviceSelector::parse(self.device.as_deref())?;
+            if let usb::device::DeviceSelector::PortPath(path) = &selector {
+                if path.split('-').any(|part| part.parse::<u8>().is_err()) {
+                    return Err(
+                        "Invalid USB port path. Use a port path or bus:address from scan.".into(),
+                    );
+                }
+            }
+            Ok(DeviceTarget::Usb(selector))
+        }
     }
 }
 
 fn main() {
     let cli = Cli::parse();
-    verbosity::set_verbose(cli.verbose || std::env::var("ARTINCHIP_FLASH_VERBOSE").is_ok());
+    let verbose = cli.verbose || std::env::var_os("ARTINCHIP_FLASH_VERBOSE").is_some();
+    verbosity::set_verbose(verbose);
+    if cli.json
+        && !matches!(
+            cli.command,
+            Commands::Scan { .. }
+                | Commands::UsbList
+                | Commands::SerialList
+                | Commands::Info { .. }
+                | Commands::EnvCheck { .. }
+                | Commands::Burn { .. }
+                | Commands::Stats { .. }
+                | Commands::SdList
+                | Commands::Update { .. }
+        )
+    {
+        eprintln!("Error: --json is unavailable for this command");
+        std::process::exit(2);
+    }
 
     match cli.command {
-        Commands::Scan => cmd_scan(cli.json),
+        Commands::Scan { require_device } => cmd_scan(cli.json, require_device),
         Commands::UsbList => cmd_usb_list(cli.json),
         Commands::SerialList => cmd_serial_list(cli.json),
-        Commands::Info {
-            image,
-            uart,
-            baud,
-            speed,
-            no_enter_upg,
-        } => cmd_info(image, uart, baud, speed, !no_enter_upg),
+        Commands::Info { image, transport } => cmd_info(image, transport, cli.json),
         Commands::Burn {
             image,
             no_reset,
             force_upgrade,
             partition,
             plan,
-            device,
             no_updater,
             erase_all,
             erase_media,
             upgcmd_path,
             log_file,
-            uart,
-            baud,
-            speed,
-            no_enter_upg,
+            transport,
+            progress,
         } => cmd_burn(BurnFlags {
             image,
             no_reset,
             force_upgrade,
             partition,
             plan,
-            device,
             no_updater,
             erase_all,
             erase_media,
             upgcmd_path,
             log_file,
-            uart,
-            baud,
-            speed,
-            auto_enter: !no_enter_upg,
+            transport,
+            progress,
+            verbose,
             json: cli.json,
         }),
         Commands::UartMonitor {
@@ -413,7 +478,7 @@ fn main() {
             baud,
             enter_upg,
         } => cmd_uart_monitor(port, baud, enter_upg),
-        Commands::EnvCheck { image } => cmd_env_check(image),
+        Commands::EnvCheck { image } => cmd_env_check(image, cli.json),
         Commands::InstallUsbAccess => cmd_install_usb_access(),
         Commands::Write {
             address,
@@ -465,15 +530,6 @@ fn main() {
     }
 }
 
-fn open_uart_shared(
-    port: &str,
-    baud: u32,
-    speed: Option<u32>,
-    auto_enter: bool,
-) -> Result<artinchip_flash_app::uart::UartDevice, String> {
-    services::open_uart(&UartSpec::new(port, baud, speed, auto_enter))
-}
-
 /// Default official `upgcmd` path used by `--erase-all` when the caller did
 /// not pass `--upgcmd-path`. Mirrors the GUI compat default: Windows tries
 /// `C:\ArtInChip\AiBurn\upgcmd.exe`, other platforms have no default and the
@@ -494,7 +550,7 @@ fn default_upgcmd_path() -> PathBuf {
 fn cmd_uart_monitor(port: String, baud: u32, enter_upg: bool) {
     if let Err(e) = artinchip_flash_app::uart::run_cli_monitor(&port, baud, enter_upg) {
         eprintln!("{}", e);
-        std::process::exit(1);
+        std::process::exit(3);
     }
 }
 
@@ -599,15 +655,17 @@ fn cmd_usb_list(json: bool) {
     }
 }
 
-fn cmd_scan(json: bool) {
+fn cmd_scan(json: bool, require_device: bool) {
     match usb::device::AicDevice::scan_devices() {
         Ok(devices) if devices.is_empty() => {
             if json {
                 println!("{}", serde_json::json!({ "devices": [] }));
-                return;
+            } else {
+                println!("No ArtInChip device found (VID=0x33C3, PID=0x6677)");
             }
-            eprintln!("No ArtInChip device found (VID=0x33C3, PID=0x6677)");
-            std::process::exit(1);
+            if require_device {
+                std::process::exit(3);
+            }
         }
         Ok(devices) => {
             if json {
@@ -666,58 +724,54 @@ fn cmd_scan(json: bool) {
     }
 }
 
-fn cmd_info(
-    image: Option<PathBuf>,
-    uart: Option<String>,
-    baud: u32,
-    speed: Option<u32>,
-    auto_enter: bool,
-) {
+fn cmd_info(image: Option<PathBuf>, transport: TransportArgs, json: bool) {
     if let Some(path) = image {
-        // Parse local image file (shared formatter, no direct lib printing).
-        match fs::read(&path) {
-            Ok(data) => match image::parser::format_image_info(&data) {
-                Ok(text) => println!("{}", text),
-                Err(e) => {
-                    eprintln!("Error parsing image: {}", e);
-                    std::process::exit(1);
-                }
-            },
-            Err(e) => {
-                eprintln!("Error reading '{}': {}", path.display(), e);
-                std::process::exit(1);
-            }
+        let bytes = fs::read(&path).unwrap_or_else(|error| {
+            cli_error(2, format!("Error reading '{}': {error}", path.display()))
+        });
+        if json {
+            let image =
+                FirmwareImage::from_bytes(bytes).unwrap_or_else(|error| cli_error(2, error));
+            let summary = image.summary();
+            let components: Vec<_> = summary.metas.iter().map(|meta| serde_json::json!({
+                "name":meta.name, "partition":meta.partition, "partition_media":meta.partition_media,
+                "offset":meta.offset, "size":meta.size, "crc":meta.crc, "ram":meta.ram, "attr":meta.attr,
+            })).collect();
+            println!(
+                "{}",
+                serde_json::json!({
+                    "kind":"image", "platform":summary.platform, "product":summary.product,
+                    "version":summary.version, "total_size":summary.total_size, "media_type":summary.media_type,
+                    "media_dev_id":summary.media_dev_id, "components":components,
+                })
+            );
+        } else {
+            let text = image::parser::format_image_info(&bytes)
+                .unwrap_or_else(|error| cli_error(2, error));
+            println!("{text}");
         }
         return;
     }
-
-    let result = if let Some(port) = uart {
-        open_uart_shared(&port, baud, speed, auto_enter).and_then(|mut dev| {
-            println!("=== Device Info ({}) ===", dev.transport_name());
-            for line in dev.device_info_lines()? {
-                println!("  {}", line);
-            }
-            if let Ok(media) = dev.get_storage_media() {
-                println!("  Storage media: {}", media);
-            }
-            Ok(())
-        })
+    let mut device = open_target(&transport);
+    let lines = device
+        .device_info_lines()
+        .unwrap_or_else(|error| cli_error(4, error));
+    let media = device.get_storage_media().ok();
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "kind":"device", "transport":device.transport_name(), "lines":lines, "storage_media":media,
+            })
+        );
     } else {
-        usb::device::AicDevice::open_first().and_then(|mut dev| {
-            println!("=== Device Info (USB) ===");
-            for line in dev.device_info_lines()? {
-                println!("  {}", line);
-            }
-            if let Ok(media) = dev.get_storage_media() {
-                println!("  Storage media: {}", media);
-            }
-            Ok(())
-        })
-    };
-
-    if let Err(e) = result {
-        eprintln!("{}", e);
-        std::process::exit(1);
+        println!("=== Device Info ({}) ===", device.transport_name());
+        for line in lines {
+            println!("  {line}");
+        }
+        if let Some(media) = media {
+            println!("  Storage media: {media}");
+        }
     }
 }
 
@@ -728,16 +782,14 @@ struct BurnFlags {
     force_upgrade: bool,
     partition: Vec<String>,
     plan: bool,
-    device: Option<String>,
     no_updater: bool,
     erase_all: bool,
     erase_media: Option<String>,
     upgcmd_path: Option<PathBuf>,
     log_file: Option<PathBuf>,
-    uart: Option<String>,
-    baud: u32,
-    speed: Option<u32>,
-    auto_enter: bool,
+    transport: TransportArgs,
+    progress: ProgressMode,
+    verbose: bool,
     json: bool,
 }
 
@@ -748,26 +800,37 @@ fn cmd_burn(flags: BurnFlags) {
         force_upgrade,
         partition,
         plan,
-        device,
         no_updater,
         erase_all,
         erase_media,
         upgcmd_path,
         log_file,
-        uart,
-        baud,
-        speed,
-        auto_enter,
+        transport,
+        progress,
+        verbose,
         json,
     } = flags;
-    let image = FirmwareImage::open(&image_path).unwrap_or_else(|error| {
-        if matches!(error, FlashError::ImageIo { .. }) {
-            eprintln!("{error}");
-        } else {
-            eprintln!("Error parsing image: {error}");
-        }
-        std::process::exit(1);
-    });
+    let mut output = BurnOutput::new(
+        json && !plan,
+        progress,
+        verbose,
+        log_file.as_deref().filter(|_| !plan),
+    );
+    let reject = |output: &mut BurnOutput, error: &dyn std::fmt::Display| -> ! {
+        output.finish(&BurnReport::default(), 2, Some(&error.to_string()));
+        std::process::exit(2)
+    };
+    let target = transport
+        .target()
+        .unwrap_or_else(|error| reject(&mut output, &error));
+    if erase_media
+        .as_deref()
+        .is_some_and(|value| value.trim().parse::<u32>().is_err())
+    {
+        reject(&mut output, &"--erase-media requires a decimal media ID");
+    }
+    let image =
+        FirmwareImage::open(&image_path).unwrap_or_else(|error| reject(&mut output, &error));
     let summary = image.summary();
     let image_description = format!(
         "Image: {} {} v{} ({} components, {} bytes total)",
@@ -784,8 +847,10 @@ fn cmd_burn(flags: BurnFlags) {
     }
 
     if !partition.is_empty() && (erase_all || force_upgrade) {
-        eprintln!("Error: --partition cannot be combined with --erase-all or --force-upgrade");
-        std::process::exit(2);
+        reject(
+            &mut output,
+            &"--partition cannot be combined with --erase-all or --force-upgrade",
+        );
     }
 
     let cancel = Arc::new(AtomicBool::new(false));
@@ -800,10 +865,8 @@ fn cmd_burn(flags: BurnFlags) {
     if !partition.is_empty() {
         options.selected_parts = partition;
     }
-    let flash = flash_job::prepare(&image, options, erase_all).unwrap_or_else(|error| {
-        eprintln!("Error: {error}");
-        std::process::exit(2);
-    });
+    let flash = flash_job::prepare(&image, options, erase_all)
+        .unwrap_or_else(|error| reject(&mut output, &error));
     let burn_plan = flash.plan();
     if plan {
         if json {
@@ -814,6 +877,20 @@ fn cmd_burn(flags: BurnFlags) {
             }
         }
         return;
+    }
+    if erase_all
+        && (matches!(
+            target,
+            DeviceTarget::Usb(usb::device::DeviceSelector::Unique)
+        ) || transport
+            .uart
+            .as_deref()
+            .is_some_and(|port| port.trim().eq_ignore_ascii_case("auto")))
+    {
+        reject(
+            &mut output,
+            &"--erase-all requires an explicit --device or UART port",
+        );
     }
 
     if force_upgrade {
@@ -827,191 +904,69 @@ fn cmd_burn(flags: BurnFlags) {
         tool: upgcmd_path.unwrap_or_else(default_upgcmd_path),
         media: erase_media,
         image: Some(image_path.clone()),
-        uart_baudrate: uart.as_ref().and(speed),
+        uart_baudrate: transport.uart.as_ref().and(transport.speed),
     });
-    let target = match uart.as_deref() {
-        Some(port) => DeviceTarget::Uart(UartSpec::new(port, baud, speed, auto_enter)),
-        None => match usb::device::DeviceSelector::parse(device.as_deref()) {
-            Ok(selector) => DeviceTarget::Usb(selector),
-            Err(error) => {
-                eprintln!("Burn failed: {error}");
-                std::process::exit(burn_error_exit_code(&error));
-            }
-        },
-    };
 
-    let _ = ctrlc::set_handler(move || cancel.store(true, Ordering::SeqCst));
+    if let Err(error) = ctrlc::set_handler(move || cancel.store(true, Ordering::SeqCst)) {
+        eprintln!("Warning: could not register cancellation handler: {error}");
+    }
     eprintln!("Press Ctrl+C to cancel the burn (aborts at the next chunk).");
-    let started = Instant::now();
-    let mut log_lines = Vec::new();
     let job = FlashJob {
         flash: &flash,
         target,
         erase,
         report_device_info: true,
     };
-    let result = job.run(|event| match event {
-        JobEvent::Output(line) if json => eprintln!("{line}"),
-        JobEvent::Output(line) => println!("{line}"),
-        JobEvent::Progress(event) => render_burn_event(event, json, started, &mut log_lines),
-    });
-    if let Err(JobError::PreErase(error)) = &result {
-        eprintln!("{error}");
-        std::process::exit(1);
-    }
-
-    let elapsed = started.elapsed();
-    if let Some(path) = &log_file {
-        if log_lines.is_empty() {
-            eprintln!("Warning: no burn events captured, --log-file not written");
-        } else {
-            match services::write_log_file(path, &log_lines) {
-                Ok(()) => eprintln!("Burn event log saved to {}", path.display()),
-                Err(e) => eprintln!("Warning: could not save burn log: {}", e),
-            }
-        }
-    }
-    if let Err(error) = result {
-        let cancelled = matches!(error, JobError::Upgrade(FlashError::Cancelled));
-        let e = error.to_string();
-        // Record the outcome for `stats` before exiting (best effort only;
-        // a stats failure must not mask the burn result).
-        let outcome = burn_stats::classify_error(&e);
-        let app_dir = standalone::default_app_dir();
-        if let Err(stat_err) = burn_stats::record(&app_dir, outcome) {
-            eprintln!("Warning: could not record burn stats: {}", stat_err);
-        }
-        if cancelled {
-            eprintln!(
-                "Burn cancelled after {:.1}s (device stays in upgrade mode; retry when ready).",
-                elapsed.as_secs_f64()
-            );
-            std::process::exit(130);
-        }
-        eprintln!("Burn failed after {:.1}s: {}", elapsed.as_secs_f64(), e);
-        std::process::exit(burn_error_exit_code(&e));
-    }
-
-    if let Err(e) = burn_stats::record(&standalone::default_app_dir(), BurnOutcome::Success) {
+    let mut report = BurnReport::default();
+    let result = job.run_reported(&mut report, |event| output.event(event));
+    let (code, outcome) = match &result {
+        Ok(()) => (0, BurnOutcome::Success),
+        Err(JobError::Connect(_)) => (3, BurnOutcome::Failure),
+        Err(JobError::PreErase(_)) => (1, BurnOutcome::Failure),
+        Err(JobError::Upgrade(FlashError::Cancelled)) => (130, BurnOutcome::Cancelled),
+        Err(JobError::Upgrade(
+            FlashError::ImageIo { .. } | FlashError::InvalidImage(_) | FlashError::InvalidPlan(_),
+        )) => (2, BurnOutcome::Failure),
+        Err(JobError::Upgrade(_)) => (4, BurnOutcome::Failure),
+    };
+    if let Err(e) = burn_stats::record(&standalone::default_app_dir(), outcome) {
         eprintln!("Warning: could not record burn stats: {}", e);
     }
-
-    eprintln!(
-        "Burn completed successfully in {:.1}s (avg {}).",
-        elapsed.as_secs_f64(),
-        format_rate(summary.total_size as f64 / elapsed.as_secs_f64().max(0.001))
-    );
-    if !json {
-        println!("Burn completed successfully!");
+    let error = result.err().map(|error| error.to_string());
+    output.finish(&report, code, error.as_deref());
+    if code != 0 {
+        std::process::exit(code);
     }
 }
 
-fn burn_error_exit_code(err: &str) -> i32 {
-    if err.contains("cancelled") {
-        130
-    } else if err.contains("Multiple ArtInChip")
-        || err.contains("No ArtInChip device")
-        || err.contains("disappeared")
-        || err.contains("No device")
-    {
-        3
-    } else if err.contains("Unknown target partition")
-        || err.contains("Duplicate partition")
-        || err.contains("No target")
-        || err.contains("CRC mismatch")
-        || err.contains("image.info")
-        || err.contains("META")
-    {
-        2
-    } else {
-        4
-    }
+fn cli_error(code: i32, error: impl std::fmt::Display) -> ! {
+    eprintln!("Error: {error}");
+    std::process::exit(code)
 }
 
-fn render_burn_event(event: BurnEvent, json: bool, started: Instant, log_lines: &mut Vec<String>) {
-    let elapsed = started.elapsed();
-    if json {
-        let value = event.to_json(elapsed);
-        println!("{}", value);
-        log_lines.push(value.to_string());
-    } else {
-        let line = match event {
-            BurnEvent::Log(line) | BurnEvent::Stage(line) => line,
-            BurnEvent::ComponentStarted {
-                name,
-                partition,
-                size,
-            } => {
-                format!("Meta {} partition={} size={} ...", name, partition, size)
-            }
-            BurnEvent::ComponentProgress { name, sent, total } => {
-                format!(
-                    "  {}: {}/{} ({:.1}%) {} {}",
-                    name,
-                    sent,
-                    total,
-                    services::progress_ratio(sent, total) * 100.0,
-                    format_rate(sent as f64 / elapsed.as_secs_f64().max(0.001)),
-                    format_elapsed(elapsed),
-                )
-            }
-            BurnEvent::OverallProgress { sent, total } => {
-                format!(
-                    "  Overall: {}/{} ({:.1}%) {} {}",
-                    sent,
-                    total,
-                    services::progress_ratio(sent, total) * 100.0,
-                    format_rate(sent as f64 / elapsed.as_secs_f64().max(0.001)),
-                    format_elapsed(elapsed),
-                )
-            }
-            BurnEvent::ComponentFinished { name } => {
-                format!("Component done: {}", name)
-            }
-            BurnEvent::Finished => format!("Burn finished {}", format_elapsed(elapsed)),
-        };
-        eprintln!("{}", line);
-        log_lines.push(line);
-    }
+fn open_target(transport: &TransportArgs) -> UpgDevice<Box<dyn UpgTransport>> {
+    let target = transport
+        .target()
+        .unwrap_or_else(|error| cli_error(2, error));
+    target.open().unwrap_or_else(|error| {
+        cli_error(
+            3,
+            format!(
+                "{error}\nCheck the target and permissions with scan, serial-list or env-check."
+            ),
+        )
+    })
 }
 
-fn format_rate(bps: f64) -> String {
-    if !bps.is_finite() || bps <= 0.0 {
-        return "--".to_string();
-    }
-    const MIB: f64 = 1024.0 * 1024.0;
-    const KIB: f64 = 1024.0;
-    if bps >= MIB {
-        format!("{:.2} MiB/s", bps / MIB)
-    } else if bps >= KIB {
-        format!("{:.1} KiB/s", bps / KIB)
-    } else {
-        format!("{:.0} B/s", bps)
-    }
-}
-
-fn format_elapsed(elapsed: std::time::Duration) -> String {
-    format!(
-        "[{:02}:{:02}]",
-        elapsed.as_secs() / 60,
-        elapsed.as_secs() % 60
-    )
-}
-
-/// Run `f` against an opened native device; print the error and exit 1.
+/// Run `f` against the selected native device.
 fn with_native_device(
     transport: &TransportArgs,
     f: impl FnOnce(&mut UpgDevice<Box<dyn UpgTransport>>) -> Result<(), String>,
 ) {
-    match transport.open().and_then(|mut dev| {
-        eprintln!("Transport: {}", dev.transport_name());
-        f(&mut dev)
-    }) {
-        Ok(()) => {}
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
+    let mut dev = open_target(transport);
+    eprintln!("Transport: {}", dev.transport_name());
+    if let Err(error) = f(&mut dev) {
+        cli_error(4, error);
     }
 }
 
@@ -1020,7 +975,7 @@ fn must_parse_u32(label: &str, text: &str) -> u32 {
         Ok(value) => value,
         Err(e) => {
             eprintln!("Invalid {} ('{}'): {}", label, text, e);
-            std::process::exit(1);
+            std::process::exit(2);
         }
     }
 }
@@ -1046,7 +1001,7 @@ fn cmd_write(
     };
     if skip_bytes > file.len() {
         eprintln!("Skip {} exceeds input size {}", skip_bytes, file.len());
-        std::process::exit(1);
+        std::process::exit(2);
     }
     let mut data = &file[skip_bytes..];
     if let Some(len_text) = length.as_deref() {
@@ -1055,7 +1010,7 @@ fn cmd_write(
     }
     if data.is_empty() {
         eprintln!("Nothing to write (input empty after skip/length)");
-        std::process::exit(1);
+        std::process::exit(2);
     }
     let len = data.len();
     with_native_device(&transport, |dev| {
@@ -1070,7 +1025,7 @@ fn cmd_read(address: String, length: String, output: PathBuf, transport: Transpo
     let len = must_parse_u32("length", &length);
     if len == 0 {
         eprintln!("Length must be > 0");
-        std::process::exit(1);
+        std::process::exit(2);
     }
     with_native_device(&transport, |dev| {
         let data = dev.read_memory(addr, len)?;
@@ -1081,7 +1036,7 @@ fn cmd_read(address: String, length: String, output: PathBuf, transport: Transpo
                 addr,
                 output.display()
             ),
-            Err(e) => return Err(format!("Error writing '{}': {}", output.display(), e)),
+            Err(e) => cli_error(1, format!("Error writing '{}': {}", output.display(), e)),
         }
         Ok(())
     });
@@ -1121,7 +1076,7 @@ fn cmd_hexdump(address: String, length: String, transport: TransportArgs) {
     let len = must_parse_u32("length", &length);
     if len == 0 {
         eprintln!("Length must be > 0");
-        std::process::exit(1);
+        std::process::exit(2);
     }
     with_native_device(&transport, |dev| {
         let data = dev.read_memory(addr, len)?;
@@ -1136,7 +1091,7 @@ fn cmd_fill(address: String, length: String, value: String, transport: Transport
     let val = must_parse_u32("value", &value);
     if val > 0xFF {
         eprintln!("Fill value must be a byte (0-255), got {:#x}", val);
-        std::process::exit(1);
+        std::process::exit(2);
     }
     with_native_device(&transport, |dev| {
         dev.fill_memory(addr, len, val as u8)?;
@@ -1173,7 +1128,7 @@ fn cmd_shcmd(shell: Vec<String>, transport: TransportArgs) {
     let line = shell.join(" ");
     if line.trim().is_empty() {
         eprintln!("Shell command must not be empty");
-        std::process::exit(1);
+        std::process::exit(2);
     }
     with_native_device(&transport, |dev| {
         dev.run_shell(&line)?;
@@ -1197,8 +1152,13 @@ fn cmd_log(transport: TransportArgs) {
     });
 }
 
-fn cmd_env_check(image: Option<PathBuf>) {
-    println!("{}", standalone::environment_report(image.as_deref()));
+fn cmd_env_check(image: Option<PathBuf>, json: bool) {
+    let (text, structured) = standalone::environment_reports(image.as_deref());
+    if json {
+        println!("{structured}");
+    } else {
+        println!("{text}");
+    }
 }
 
 fn cmd_install_usb_access() {
@@ -1215,6 +1175,7 @@ fn cmd_stats(clear: bool, json: bool) {
     let app_dir = standalone::default_app_dir();
     if clear {
         match burn_stats::clear(&app_dir) {
+            Ok(()) if json => println!("{}", serde_json::json!({"cleared":true})),
             Ok(()) => println!("Burn statistics cleared."),
             Err(e) => {
                 eprintln!("Failed to clear burn statistics: {}", e);
@@ -1300,7 +1261,6 @@ fn cmd_update(channel: &str, open: bool, json: bool) {
             if open && status.update_available {
                 if let Err(e) = update::open_url(&status.html_url) {
                     eprintln!("{}", e);
-                    std::process::exit(1);
                 }
             }
             if status.update_available {

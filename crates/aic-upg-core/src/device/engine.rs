@@ -1,7 +1,10 @@
-use std::{thread, time::Duration};
+use std::{
+    thread,
+    time::{Duration, Instant},
+};
 
 use super::commands::UpgDevice;
-use super::events::{emit, BurnCallback, BurnEvent};
+use super::events::{emit, BurnCallback, BurnEvent, BurnReport, ResetOutcome};
 use super::options::{is_cancelled, BurnOptions};
 use super::plan::{
     classify_components, default_burn_parts, format_plan_lines, plan_burn, BurnPlan, ComponentKind,
@@ -77,6 +80,7 @@ impl<T: UpgTransport> UpgDevice<T> {
         verify_stage: bool,
         mut callback: Option<&mut BurnCallback<'_>>,
     ) -> Result<(), FlashError> {
+        self.burn_report = BurnReport::default();
         check_cancelled(options, &mut callback)?;
         if verify_stage {
             let stage = self
@@ -142,7 +146,7 @@ impl<T: UpgTransport> UpgDevice<T> {
                     );
                     let probe = self.get_hwinfo().or_else(|error| {
                         if plan.uses_header_media && executable {
-                            self.transport.reconnect(options.burn_timeout)?;
+                            self.burn_reconnect(options.burn_timeout)?;
                             self.get_hwinfo()
                         } else {
                             Err(error)
@@ -160,7 +164,7 @@ impl<T: UpgTransport> UpgDevice<T> {
                 &mut callback,
                 BurnEvent::Stage("Wait for bootloader reconnect".to_string()),
             );
-            if let Err(e) = self.transport.reconnect(options.burn_timeout) {
+            if let Err(e) = self.burn_reconnect(options.burn_timeout) {
                 emit(
                     &mut callback,
                     BurnEvent::Log(format!(
@@ -262,6 +266,7 @@ impl<T: UpgTransport> UpgDevice<T> {
         emit(&mut callback, BurnEvent::Stage("End upgrade".to_string()));
         self.set_upg_end()
             .map_err(|message| FlashError::device("end upgrade", message))?;
+        self.burn_report.upgrade_ended = true;
         // Force upgrade and post-burn reset are mutually exclusive: the
         // device stays in upgrade mode so the forced image can be verified.
         let do_reset = options.reset_after_burn && !options.force_upgrade;
@@ -273,16 +278,30 @@ impl<T: UpgTransport> UpgDevice<T> {
         }
         if do_reset {
             emit(&mut callback, BurnEvent::Stage("Reset device".to_string()));
-            if let Err(e) = self.reset() {
-                emit(
-                    &mut callback,
-                    BurnEvent::Log(format!("Warning: reset failed: {}", e)),
-                );
+            self.burn_report.reset = self.reset_for_burn();
+            let warning = match &self.burn_report.reset {
+                ResetOutcome::Failed(error) => Some(format!("Warning: reset failed: {error}")),
+                ResetOutcome::Unconfirmed(error) => {
+                    Some(format!("Warning: reset unconfirmed: {error}"))
+                }
+                _ => None,
+            };
+            if let Some(warning) = warning {
+                emit(&mut callback, BurnEvent::Log(warning));
             }
+        } else {
+            self.burn_report.reset = ResetOutcome::Skipped;
         }
         emit(&mut callback, BurnEvent::Finished);
 
         Ok(())
+    }
+
+    fn burn_reconnect(&mut self, timeout: Duration) -> Result<(), String> {
+        let started = Instant::now();
+        let result = self.transport.reconnect(timeout);
+        self.burn_report.reconnect_time += started.elapsed();
+        result
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -395,14 +414,17 @@ impl<T: UpgTransport> UpgDevice<T> {
             let chunk_size = chunk_end - data_sent;
             let chunk_data = &img_data[chunk_offset..chunk_offset + chunk_size];
 
-            if chunk_size.is_multiple_of(alignment) {
+            let started = Instant::now();
+            let result = if chunk_size.is_multiple_of(alignment) {
                 self.write_fwc_data_chunk(chunk_data, CswPolicy::Required)
             } else {
                 let mut padded = chunk_data.to_vec();
                 padded.resize(chunk_size.next_multiple_of(alignment), 0);
                 self.write_fwc_data_chunk(&padded, CswPolicy::Required)
-            }
-            .map_err(|message| FlashError::device("write component data", message))?;
+            };
+            self.burn_report.transfer_time += started.elapsed();
+            result.map_err(|message| FlashError::device("write component data", message))?;
+            self.burn_report.bytes_sent += chunk_size;
             data_sent += chunk_size;
             *overall_sent += chunk_size;
             log_verbose!(
@@ -455,6 +477,7 @@ impl<T: UpgTransport> UpgDevice<T> {
                     actual: device_crc,
                 });
             }
+            self.burn_report.device_crcs_verified += 1;
             for (cmd, action) in [
                 (CMD_GET_FWC_BURN_RESULT, "burn"),
                 (CMD_GET_FWC_RUN_RESULT, "run"),
@@ -470,6 +493,7 @@ impl<T: UpgTransport> UpgDevice<T> {
                 }
             }
         }
+        self.burn_report.components_completed += 1;
         emit(
             callback,
             BurnEvent::Log(format!("CRC OK (0x{:08x})", actual_crc)),

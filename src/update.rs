@@ -1,17 +1,9 @@
-//! Update checking against GitHub Releases.
-//!
-//! Phase 1 is check-only + guided download (no self-replacement). This is
-//! deliberate: the project ships both portable archives and native installers
-//! (`msi/setup/deb/pkg`), and only portable checkouts can safely replace
-//! their own binary. Installer users are directed to the release page.
-//!
-//! Uses the mainstream `self_update` crate for the GitHub listing API so we
-//! don't hand-roll pagination, auth-token handling or rate-limit errors.
+use std::time::Duration;
+
+use serde::Deserialize;
+use serde_json::Value;
 
 use crate::build_info;
-
-pub const REPO_OWNER: &str = "boa-w";
-pub const REPO_NAME: &str = "artinchip-flash";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UpdateChannel {
@@ -23,16 +15,37 @@ impl UpdateChannel {
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(value: &str) -> Self {
         if value.eq_ignore_ascii_case("nightly") {
-            UpdateChannel::Nightly
+            Self::Nightly
         } else {
-            UpdateChannel::Stable
+            Self::Stable
         }
     }
 
     pub fn as_str(self) -> &'static str {
         match self {
-            UpdateChannel::Stable => "stable",
-            UpdateChannel::Nightly => "nightly",
+            Self::Stable => "stable",
+            Self::Nightly => "nightly",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UpdateState {
+    Available,
+    Current,
+    LocalNewer,
+    NoRelease,
+    Unknown,
+}
+
+impl UpdateState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::Current => "current",
+            Self::LocalNewer => "local_newer",
+            Self::NoRelease => "no_release",
+            Self::Unknown => "unknown",
         }
     }
 }
@@ -44,31 +57,26 @@ pub struct UpdateStatus {
     pub current_commit: String,
     pub latest_tag: String,
     pub latest_version: Option<String>,
+    pub latest_commit: Option<String>,
     pub html_url: String,
     pub notes_preview: String,
+    pub state: UpdateState,
     pub update_available: bool,
 }
 
 impl UpdateStatus {
     pub fn summary_line(&self) -> String {
-        match self.channel {
-            UpdateChannel::Stable => {
-                let latest = self.latest_tag.as_str();
-                if self.update_available {
-                    format!(
-                        "Update available: {} -> {} ({})",
-                        self.current_version, latest, self.html_url
-                    )
-                } else {
-                    format!("Up to date: {} (latest {})", self.current_version, latest)
-                }
+        match self.state {
+            UpdateState::Available => {
+                format!("Update available: {} ({})", self.latest_tag, self.html_url)
             }
-            UpdateChannel::Nightly => {
-                if self.update_available {
-                    format!("Nightly update available: {}", self.html_url)
-                } else {
-                    "Nightly up to date".to_string()
-                }
+            UpdateState::Current => {
+                format!("Up to date: {} ({})", self.current_version, self.latest_tag)
+            }
+            UpdateState::LocalNewer => format!("Local build is newer than {}", self.latest_tag),
+            UpdateState::NoRelease => format!("No {} release is available", self.channel.as_str()),
+            UpdateState::Unknown => {
+                "Could not determine the relationship to the published nightly build".into()
             }
         }
     }
@@ -80,228 +88,394 @@ impl UpdateStatus {
             "current_commit": self.current_commit,
             "latest_tag": self.latest_tag,
             "latest_version": self.latest_version,
+            "latest_commit": self.latest_commit,
             "html_url": self.html_url,
             "update_available": self.update_available,
+            "status": self.state.as_str(),
         })
         .to_string()
     }
 }
 
-/// Check for updates. Never panics on network failure: errors are `String`.
+#[derive(Deserialize)]
+struct Release {
+    tag_name: String,
+    draft: bool,
+    prerelease: bool,
+    body: Option<String>,
+}
+
+struct Github {
+    agent: ureq::Agent,
+    base: String,
+    token: Option<String>,
+}
+
+impl Github {
+    fn get(&self, path: &str) -> Result<(Option<Value>, bool), String> {
+        let mut request = self
+            .agent
+            .get(format!("{}/{path}", self.base))
+            .header(
+                "User-Agent",
+                concat!("artinchip-flash/", env!("CARGO_PKG_VERSION")),
+            )
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28");
+        if let Some(token) = &self.token {
+            request = request.header("Authorization", format!("Bearer {token}"));
+        }
+        let mut response = request
+            .call()
+            .map_err(|error| format!("GitHub network or TLS error: {error}"))?;
+        let status = response.status().as_u16();
+        let headers = response.headers();
+        if !response_available(status, headers)? {
+            return Ok((None, false));
+        }
+        let has_next = headers
+            .get("link")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|links| links.split(',').any(|link| link.contains("rel=\"next\"")));
+        let body = response
+            .body_mut()
+            .read_to_string()
+            .map_err(|error| format!("Could not read GitHub API response: {error}"))?;
+        let data = serde_json::from_str(&body)
+            .map_err(|error| format!("Invalid GitHub API response: {error}"))?;
+        Ok((Some(data), has_next))
+    }
+}
+
+fn response_available(status: u16, headers: &ureq::http::HeaderMap) -> Result<bool, String> {
+    match status {
+        200 => Ok(true),
+        404 => Ok(false),
+        401 => Err("GitHub authentication failed. Check GH_TOKEN or GITHUB_TOKEN.".into()),
+        403 | 429
+            if status == 429
+                || headers
+                    .get("x-ratelimit-remaining")
+                    .is_some_and(|value| value == "0")
+                || headers.contains_key("retry-after") =>
+        {
+            Err("GitHub API rate limit reached. Retry later.".into())
+        }
+        403 => Err("GitHub API denied access. Check token permissions or retry later.".into()),
+        _ => Err(format!("GitHub API returned HTTP {status}")),
+    }
+}
+
 pub fn check(channel: UpdateChannel) -> Result<UpdateStatus, String> {
-    match channel {
-        UpdateChannel::Stable => check_stable(),
-        UpdateChannel::Nightly => check_nightly(),
-    }
-}
-
-fn check_stable() -> Result<UpdateStatus, String> {
-    let listing = self_update::backends::github::ReleaseList::configure()
-        .repo_owner(REPO_OWNER)
-        .repo_name(REPO_NAME)
+    let repository = build_info::REPOSITORY
+        .strip_prefix("https://github.com/")
+        .ok_or("Invalid GitHub repository in application metadata")?;
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(12)))
+        .max_redirects(0)
+        .http_status_as_error(false)
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+                .build(),
+        )
         .build()
-        .map_err(|e| map_backend_error(e.to_string()))?
-        .fetch()
-        .map_err(|e| map_backend_error(e.to_string()))?;
-
-    let current = build_info::VERSION.to_string();
-    let current_parsed = semver::Version::parse(current.trim_start_matches('v'))
-        .unwrap_or(semver::Version::new(0, 0, 0));
-
-    // `Releases` skips non-semver tags (e.g. `nightly`) internally; iterate what remains.
-    let mut best: Option<(semver::Version, String, String, String)> = None;
-    for release in listing.into_vec() {
-        let tag_version = release.version().to_string();
-        let Ok(parsed) = semver::Version::parse(tag_version.trim_start_matches('v')) else {
-            continue;
-        };
-        // Skip prereleases for the stable channel unless they are newer stable? Keep it
-        // simple: prerelease versions never win the stable channel.
-        if !parsed.pre.is_empty() {
-            continue;
-        }
-        let is_better = best.as_ref().is_none_or(|(v, _, _, _)| parsed > *v);
-        if is_better {
-            best = Some((
-                parsed,
-                tag_version,
-                release.release_notes_url().unwrap_or_default().to_string(),
-                release.body().unwrap_or_default().to_string(),
-            ));
-        }
-    }
-
-    let Some((latest_parsed, latest_version, html_url, body)) = best else {
-        return Err("No stable releases found (only prereleases/nightly exist yet). Create a `v*` tag release first.".to_string());
+        .new_agent();
+    let api = Github {
+        agent,
+        base: format!("https://api.github.com/repos/{repository}"),
+        token: ["GH_TOKEN", "GITHUB_TOKEN"]
+            .into_iter()
+            .filter_map(|name| std::env::var(name).ok())
+            .find(|value| !value.trim().is_empty()),
     };
-
-    Ok(UpdateStatus {
-        channel: UpdateChannel::Stable,
-        current_version: current.clone(),
-        current_commit: build_info::COMMIT.to_string(),
-        latest_tag: format!("v{latest_parsed}"),
-        latest_version: Some(latest_version),
-        html_url: if html_url.is_empty() {
-            releases_url()
-        } else {
-            html_url
-        },
-        notes_preview: first_lines(&body, 8),
-        update_available: latest_parsed > current_parsed,
-    })
+    check_with(channel, |path| api.get(path))
 }
 
-fn check_nightly() -> Result<UpdateStatus, String> {
-    // Nightly is a moving non-semver tag which `self_update` listings skip by
-    // design, so there is no reliable commit comparison yet. Report the nightly
-    // page and only claim an update when the local build has no commit
-    // (dev/unknown builds). Once CI embeds nightly SHAs in assets, extend this
-    // to compare them.
-    let current_commit = build_info::COMMIT.to_string();
-    Ok(UpdateStatus {
-        channel: UpdateChannel::Nightly,
-        current_version: build_info::VERSION.to_string(),
-        current_commit: current_commit.clone(),
-        latest_tag: "nightly".to_string(),
+fn check_with(
+    channel: UpdateChannel,
+    get: impl Fn(&str) -> Result<(Option<Value>, bool), String>,
+) -> Result<UpdateStatus, String> {
+    let mut result = UpdateStatus {
+        channel,
+        current_version: build_info::VERSION.into(),
+        current_commit: build_info::COMMIT.into(),
+        latest_tag: String::new(),
         latest_version: None,
-        html_url: nightly_url(),
+        latest_commit: None,
+        html_url: match channel {
+            UpdateChannel::Stable => releases_url(),
+            UpdateChannel::Nightly => nightly_url(),
+        },
         notes_preview: String::new(),
-        update_available: current_commit == "unknown" || current_commit.is_empty(),
-    })
-}
-
-/// True when the current executable lives in a user-writable portable checkout.
-///
-/// Installer locations (`Program Files`, `/usr/bin`, `/Applications`,
-/// `/opt`) must NOT self-replace; they need a re-run of the installer.
-pub fn is_portable_install() -> bool {
-    let Ok(exe) = std::env::current_exe() else {
-        return false;
+        state: UpdateState::NoRelease,
+        update_available: false,
     };
-    let path = exe.to_string_lossy().to_lowercase();
-    for managed in [
-        "program files",
-        "/usr/bin",
-        "/usr/local/bin",
-        "/applications/",
-        "/opt/",
-    ] {
-        if path.contains(managed) {
-            return false;
+    match channel {
+        UpdateChannel::Stable => {
+            let mut releases = Vec::new();
+            for page in 1.. {
+                let (data, more) = get(&format!("releases?per_page=100&page={page}"))?;
+                let data = data.ok_or(
+                    "GitHub repository unavailable. Check the repository and token permissions.",
+                )?;
+                releases.extend(
+                    serde_json::from_value::<Vec<Release>>(data)
+                        .map_err(|error| error.to_string())?,
+                );
+                if !more {
+                    break;
+                }
+            }
+            if let Some((release, version)) = stable_release(&releases) {
+                let current = semver::Version::parse(build_info::VERSION)
+                    .map_err(|error| error.to_string())?;
+                result.state = match version.cmp_precedence(&current) {
+                    std::cmp::Ordering::Greater => UpdateState::Available,
+                    std::cmp::Ordering::Equal => UpdateState::Current,
+                    std::cmp::Ordering::Less => UpdateState::LocalNewer,
+                };
+                result.latest_tag = release.tag_name.clone();
+                result.latest_version = Some(version.to_string());
+                result.html_url = format!("{}/tag/{}", releases_url(), release.tag_name);
+                result.notes_preview = preview(release.body.as_deref());
+            }
+        }
+        UpdateChannel::Nightly => {
+            if let (Some(data), _) = get("releases/tags/nightly")? {
+                let release: Release =
+                    serde_json::from_value(data).map_err(|error| error.to_string())?;
+                if !release.draft && release.tag_name == "nightly" {
+                    result.latest_tag = "nightly".into();
+                    result.latest_commit =
+                        nightly_commit(release.body.as_deref()).map(str::to_owned);
+                    result.notes_preview = preview(release.body.as_deref());
+                    result.state =
+                        compare_nightly(build_info::COMMIT, result.latest_commit.as_deref(), get)?;
+                }
+            }
         }
     }
-    // Writable parent dir ~= portable checkout we are allowed to replace later.
-    exe.parent()
-        .map(|parent| !parent.as_os_str().is_empty() && writable(parent))
-        .unwrap_or(false)
+    result.update_available = result.state == UpdateState::Available;
+    Ok(result)
 }
 
-fn writable(dir: &std::path::Path) -> bool {
-    use std::io::Write;
-    let probe = dir.join(".artinchip-flash-write-test");
-    match std::fs::File::create(&probe) {
-        Ok(mut file) => {
-            let _ = file.write_all(b"ok");
-            drop(file);
-            let _ = std::fs::remove_file(&probe);
-            true
-        }
-        Err(_) => false,
+fn stable_release(releases: &[Release]) -> Option<(&Release, semver::Version)> {
+    releases
+        .iter()
+        .filter(|release| !release.draft && !release.prerelease)
+        .filter_map(|release| {
+            let tag = &release.tag_name;
+            let version = semver::Version::parse(tag.strip_prefix('v').unwrap_or(tag)).ok()?;
+            version.pre.is_empty().then_some((release, version))
+        })
+        .max_by(|(_, left), (_, right)| left.cmp_precedence(right))
+}
+
+fn is_sha(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn nightly_commit(body: Option<&str>) -> Option<&str> {
+    body?
+        .lines()
+        .next()?
+        .strip_prefix("Automated nightly build from `")?
+        .strip_suffix("`.")
+        .filter(|value| is_sha(value))
+}
+
+fn compare_nightly(
+    local: &str,
+    remote: Option<&str>,
+    get: impl Fn(&str) -> Result<(Option<Value>, bool), String>,
+) -> Result<UpdateState, String> {
+    let Some(remote) = remote.filter(|_| is_sha(local)) else {
+        return Ok(UpdateState::Unknown);
+    };
+    if local == remote {
+        return Ok(UpdateState::Current);
     }
+    let (comparison, _) = get(&format!("compare/{local}...{remote}"))?;
+    Ok(
+        match comparison
+            .as_ref()
+            .and_then(|value| value["status"].as_str())
+        {
+            Some("ahead") => UpdateState::Available,
+            Some("behind") => UpdateState::LocalNewer,
+            Some("identical") => UpdateState::Current,
+            _ => UpdateState::Unknown,
+        },
+    )
+}
+
+fn preview(body: Option<&str>) -> String {
+    body.unwrap_or_default()
+        .lines()
+        .take(8)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub fn is_portable_install() -> bool {
+    std::env::current_exe().is_ok_and(|exe| {
+        let path = exe.to_string_lossy().to_lowercase();
+        ![
+            "program files",
+            "/usr/bin/",
+            "/usr/local/bin/",
+            "/applications/",
+            "/opt/",
+        ]
+        .iter()
+        .any(|managed| path.contains(managed))
+    })
 }
 
 pub fn releases_url() -> String {
-    format!("https://github.com/{REPO_OWNER}/{REPO_NAME}/releases")
+    format!("{}/releases", build_info::REPOSITORY)
 }
 
 pub fn nightly_url() -> String {
-    format!("https://github.com/{REPO_OWNER}/{REPO_NAME}/releases/tag/nightly")
+    format!("{}/tag/nightly", releases_url())
 }
 
-/// Open a URL with the OS default handler without adding an `open` dependency.
+#[cfg(any(windows, unix))]
 pub fn open_url(url: &str) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+    let mut command;
     #[cfg(windows)]
     {
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
-            .spawn()
-            .map_err(|e| format!("Failed to open '{}': {}", url, e))?;
-        Ok(())
+        command = Command::new("rundll32.exe");
+        command.arg("url.dll,FileProtocolHandler");
     }
     #[cfg(target_os = "macos")]
     {
-        std::process::Command::new("open")
-            .arg(url)
-            .spawn()
-            .map_err(|e| format!("Failed to open '{}': {}", url, e))?;
-        Ok(())
+        command = Command::new("open");
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        std::process::Command::new("xdg-open")
-            .arg(url)
-            .spawn()
-            .map_err(|e| format!("Failed to open '{}': {}", url, e))?;
-        Ok(())
+        if ["DISPLAY", "WAYLAND_DISPLAY"]
+            .iter()
+            .all(|name| std::env::var_os(name).is_none_or(|value| value.is_empty()))
+        {
+            return Err(format!(
+                "No graphical browser session. Open {url} on another machine."
+            ));
+        }
+        command = Command::new("xdg-open");
     }
-    #[cfg(all(not(windows), not(unix)))]
-    {
-        Err(format!("Opening URLs is not implemented: {}", url))
+    let status = command
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| format!("Could not launch a browser: {error}. Open {url} manually."))?;
+    if !status.success() {
+        return Err(format!(
+            "No browser accepted the request. Open {url} manually."
+        ));
     }
+    Ok(())
 }
 
-fn first_lines(body: &str, max: usize) -> String {
-    body.lines().take(max).collect::<Vec<_>>().join("\n")
-}
-
-fn map_backend_error(message: String) -> String {
-    if message.contains("RateLimited") || message.contains("rate limit") || message.contains("403")
-    {
-        return format!(
-            "GitHub API rate limited (60 req/h unauthenticated). Set GH_TOKEN/GITHUB_TOKEN and retry. Detail: {}",
-            message
-        );
-    }
-    if message.contains("NoReleaseFound") || message.contains("404") {
-        return format!(
-            "No releases found. The project currently only publishes `nightly`; create a `v*` tag release first. Detail: {}",
-            message
-        );
-    }
-    format!("Update check failed: {}. See {}", message, releases_url())
+#[cfg(not(any(windows, unix)))]
+pub fn open_url(url: &str) -> Result<(), String> {
+    Err(format!("Open {url} manually in a browser."))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
-    fn channel_parsing_defaults_to_stable() {
-        assert_eq!(UpdateChannel::from_str("nightly"), UpdateChannel::Nightly);
-        assert_eq!(UpdateChannel::from_str("STABLE"), UpdateChannel::Stable);
-        assert_eq!(UpdateChannel::from_str("bogus"), UpdateChannel::Stable);
+    fn github_http_statuses_distinguish_absence_authentication_rate_limits_and_server_failure() {
+        let mut headers = ureq::http::HeaderMap::new();
+        assert!(!response_available(404, &headers).unwrap());
+        assert!(response_available(401, &headers)
+            .unwrap_err()
+            .contains("authentication"));
+        assert!(response_available(403, &headers)
+            .unwrap_err()
+            .contains("denied access"));
+        assert!(response_available(503, &headers)
+            .unwrap_err()
+            .contains("503"));
+        headers.insert("x-ratelimit-remaining", "0".parse().unwrap());
+        for status in [403, 429] {
+            assert!(response_available(status, &headers)
+                .unwrap_err()
+                .contains("rate limit"));
+        }
     }
 
     #[test]
-    fn summary_and_json_shape() {
-        let status = UpdateStatus {
-            channel: UpdateChannel::Stable,
-            current_version: "0.1.0".to_string(),
-            current_commit: "abc".to_string(),
-            latest_tag: "v0.2.0".to_string(),
-            latest_version: Some("0.2.0".to_string()),
-            html_url: "https://example.test/r".to_string(),
-            notes_preview: String::new(),
-            update_available: true,
-        };
-        assert!(status.summary_line().contains("0.1.0 -> v0.2.0"));
-        let json = status.to_json();
-        assert!(json.contains("\"update_available\":true"));
+    fn stable_filters_release_flags_and_orders_semver() {
+        let releases = json!([
+            {"tag_name":"v10.0.0","draft":true,"prerelease":false},
+            {"tag_name":"v9.0.0","draft":false,"prerelease":true},
+            {"tag_name":"v8.0.0-rc.1","draft":false,"prerelease":false},
+            {"tag_name":"nightly","draft":false,"prerelease":true},
+            {"tag_name":"v0.2.10","draft":false,"prerelease":false},
+            {"tag_name":"v0.2.9","draft":false,"prerelease":false},
+        ]);
+        let status = check_with(UpdateChannel::Stable, |path| {
+            assert_eq!(path, "releases?per_page=100&page=1");
+            Ok((Some(releases.clone()), false))
+        })
+        .unwrap();
+        assert_eq!(status.state, UpdateState::Available);
+        assert_eq!(status.latest_tag, "v0.2.10");
+        for (response, expected) in [
+            (json!([]), UpdateState::NoRelease),
+            (
+                json!([{"tag_name":"v0.2.1","draft":false,"prerelease":false}]),
+                UpdateState::LocalNewer,
+            ),
+        ] {
+            assert_eq!(
+                check_with(UpdateChannel::Stable, |_| Ok((
+                    Some(response.clone()),
+                    false
+                )))
+                .unwrap()
+                .state,
+                expected
+            );
+        }
     }
 
     #[test]
-    fn releases_urls_point_at_repo() {
-        assert!(releases_url().contains(REPO_NAME));
-        assert!(nightly_url().ends_with("/nightly"));
+    fn nightly_compares_published_sha_in_commit_order() {
+        let local = "a".repeat(40);
+        let remote = "b".repeat(40);
+        let metadata = format!("Automated nightly build from `{remote}`.\n");
+        assert_eq!(nightly_commit(Some(&metadata)), Some(remote.as_str()));
+        assert_eq!(nightly_commit(Some("nightly from main")), None);
+        assert_eq!(
+            compare_nightly(&local, Some(&local), |_| unreachable!()).unwrap(),
+            UpdateState::Current
+        );
+        assert_eq!(
+            compare_nightly("unknown", Some(&remote), |_| unreachable!()).unwrap(),
+            UpdateState::Unknown
+        );
+        for (relation, state) in [
+            ("ahead", UpdateState::Available),
+            ("behind", UpdateState::LocalNewer),
+            ("diverged", UpdateState::Unknown),
+        ] {
+            assert_eq!(
+                compare_nightly(&local, Some(&remote), |path| {
+                    assert_eq!(path, format!("compare/{local}...{remote}"));
+                    Ok((Some(json!({"status":relation})), false))
+                })
+                .unwrap(),
+                state
+            );
+        }
     }
 }

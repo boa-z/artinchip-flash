@@ -26,13 +26,98 @@ impl ImageFile {
     }
 
     fn cli(&self, command: &str, flags: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_artinchip-flash"))
+        cli()
             .arg(command)
             .arg(&self.0)
             .args(flags)
             .output()
             .unwrap()
     }
+}
+
+fn cli() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_artinchip-flash"))
+}
+
+fn json_stdout(output: &Output) -> Value {
+    assert!(!output.stdout.contains(&0x1b));
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[test]
+fn cli_help_version_and_exit_contract() {
+    let help = cli().arg("--help").output().unwrap();
+    assert!(help.status.success());
+    assert!(String::from_utf8_lossy(&help.stdout).contains("Commands:"));
+    let version = cli().arg("--version").output().unwrap();
+    let version_text = String::from_utf8_lossy(&version.stdout);
+    assert!(version.status.success());
+    assert_eq!(
+        version_text.lines().next(),
+        Some(concat!("artinchip-flash ", env!("CARGO_PKG_VERSION")))
+    );
+    for field in ["build: ", "commit: ", "channel: ", "target: "] {
+        assert!(version_text.lines().any(|line| line.starts_with(field)));
+    }
+
+    for args in [
+        &["info", "--uart", "auto", "--device", "1:2"][..],
+        &["readl", "bad", "--device", "1:2"],
+        &["readl", "0", "--device", "bad:address"],
+        &["readl", "0", "--json"],
+        &["update", "--channel", "invalid"],
+    ] {
+        let output = cli().args(args).output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert!(!output.stderr.is_empty(), "{args:?}");
+    }
+}
+
+#[test]
+fn cli_queries_emit_single_json_objects_and_empty_scan_is_successful() {
+    let image = ImageFile::new(&fixture::firmware());
+    let info = image.cli("info", &["--json"]);
+    assert!(info.status.success());
+    let info = json_stdout(&info);
+    assert_eq!(info["kind"], "image");
+    assert_eq!(info["components"].as_array().unwrap().len(), 4);
+    let scan = cli().args(["scan", "--json"]).output().unwrap();
+    assert!(scan.status.success());
+    let found = json_stdout(&scan);
+    if found["devices"].as_array().unwrap().is_empty() {
+        assert!(cli().arg("scan").output().unwrap().status.success());
+        let required = cli()
+            .args(["scan", "--json", "--require-device"])
+            .output()
+            .unwrap();
+        assert_eq!(required.status.code(), Some(3));
+        assert_eq!(json_stdout(&required), found);
+        let info = cli().args(["info", "--json"]).output().unwrap();
+        assert_eq!(info.status.code(), Some(3));
+        assert!(info.stdout.is_empty());
+    }
+}
+
+#[test]
+fn burn_validation_emits_a_final_result_and_saves_the_failure_log() {
+    let image = ImageFile::new(&[]);
+    let log = image.0.with_extension("ndjson");
+    let output = cli()
+        .arg("burn")
+        .arg(&image.0)
+        .args(["--json", "--log-file"])
+        .arg(&log)
+        .output()
+        .unwrap();
+    let logged = fs::read(&log).unwrap();
+    fs::remove_file(log).unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let result = json_stdout(&output);
+    assert_eq!(result["type"], "result");
+    assert_eq!(result["reset"], "not_attempted");
+    assert_eq!(result["bytes_sent"], 0);
+    assert_eq!(serde_json::from_slice::<Value>(&logged).unwrap(), result);
 }
 
 impl Drop for ImageFile {
@@ -113,7 +198,7 @@ fn cli_checks_invalid_burn_before_using_device_or_vendor_program() {
     let output = ImageFile::new(&corrupt).cli("burn", &["--erase-all"]);
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("image.target.os: CRC mismatch"));
-    assert_eq!(ImageFile::new(&[]).cli("info", &[]).status.code(), Some(1));
+    assert_eq!(ImageFile::new(&[]).cli("info", &[]).status.code(), Some(2));
 }
 
 #[test]

@@ -27,11 +27,13 @@ cargo check --locked -p artinchip-flash --no-default-features --features uart
 python3 scripts/check_sdk_consumer.py
 ```
 
-On Linux x86-64, `qemu-x86_64 -cpu Nehalem target/release/artinchip-flash --help` and the same command with `--version` exercise the release CLI on a non-AVX CPU model. CI checks `ldd` and the CLI DEB's `Depends`, then checks package installation, CLI startup under QEMU, GUI startup under Xvfb and package switching on Debian 13. Update checks use Rustls with ring and the platform trust store.
+On Linux x86-64, CI runs the release CLI under `qemu-x86_64 -cpu Nehalem` with `--help`, `--version` and `scan --json`. It checks `ldd` and the CLI DEB's `Depends`, then verifies package installation, GUI startup under Xvfb and package switching on Debian 13. Update checks use Rustls with ring and the platform trust store.
 
 The suite exercises fixed protocol vectors, firmware validation, command ordering, failure handling and CLI output using synthetic images and scripted transports. The external SDK check builds a separate Cargo project without USB, UART or GUI dependencies and runs a simulated partition upgrade through the public API.
 
 ## Hardware validation
+
+CLI startup on Debian 13 x86-64 with a non-AVX Intel Celeron N3160 has been verified on physical hardware. CI builds and tests Intel macOS, Windows arm64 and Linux arm64 on GitHub-hosted runners. Physical hardware testing for these three variants is pending.
 
 The D213 hardware checklist is pending. Use a recoverable board and known-good firmware. Record the host OS and build SHA, board and bootloader revisions, storage medium and firmware SHA-256. Collect the offline plan, exit status, event log and any serial console output.
 
@@ -42,7 +44,7 @@ The D213 hardware checklist is pending. Use a recoverable board and known-good f
 
 ## Release
 
-Update the root `Cargo.toml` version and `Cargo.lock`, then tag the release commit as `vX.Y.Z`. Publishing the tag triggers the Windows, Linux and macOS build and release workflow. A push to `main` refreshes `nightly` unless the commit message contains `[skip nightly]`.
+Update the root application's `Cargo.toml` version and `Cargo.lock`. The SDK's version is managed independently. CI requires a tag of exactly `v` plus the application version and embeds the `stable` channel in that build. A push to `main` builds `nightly` and refreshes its assets unless the commit message contains `[skip nightly]`. Other builds use `development`. `--version` reports the commit and target alongside the channel, and the build ID can end in `-dirty` when tracked files are modified. The stable workflow uploads to a draft and publishes after the uploads complete. Reruns leave existing published assets in place.
 
 ## Licensing and provenance
 

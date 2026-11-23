@@ -333,7 +333,7 @@ impl GuiApp {
                             self.log(format!("  {}", line));
                         }
                     }
-                } else {
+                } else if status.state == update::UpdateState::Current {
                     self.update_status =
                         format!("{} ({})", self.t(Msg::UpToDate), status.current_version);
                     self.log(format!(
@@ -341,6 +341,9 @@ impl GuiApp {
                         self.t(Msg::UpToDate),
                         status.current_version
                     ));
+                } else {
+                    self.update_status = status.summary_line();
+                    self.log(self.update_status.clone());
                 }
             }
             Err(e) => {

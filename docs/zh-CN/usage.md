@@ -6,6 +6,8 @@
 
 在 [GitHub Releases](https://github.com/boa-z/artinchip-flash/releases) 下载对应平台的安装包。Windows 的安装向导 EXE 和 MSI、macOS arm64 的 PKG 均安装 CLI 和 GUI。便携版可选 Windows ZIP 或 macOS tar.gz。未签名的 Windows 和 macOS 安装包可能触发系统安全提示。
 
+CI 还构建 Windows arm64 的 MSI 和 ZIP、Intel macOS 的 PKG 和 tar.gz，以及 Linux arm64 的 DEB 和 tar.gz。这三个版本尚未在实机上测试。
+
 Windows 下使用「工具 → 驱动」或 `artinchip-flash install-usb-access`，可以管理员权限为 `33c3:6677` 安装 WinUSB 绑定。Linux 下同一命令会安装 udev 规则，允许普通用户访问。安装后重新连接开发板。macOS 通常无需内核驱动。若设备能打开但传输超时，关闭其他 USB 工具后重连。`scan --json` 中的 `enumerated`、`ioreg_ready` 和 `protocol_ready` 分别表示 USB 枚举、macOS 描述符就绪和 UPG 探测成功。
 
 ### Linux 安装
@@ -71,10 +73,10 @@ artinchip-flash uart-monitor /dev/ttyUSB0
 
 在「设置」中管理语言、主题、更新和统计。`config.ini`、`img_history.txt` 和 `burn_stats.json` 保存在用户配置目录。Windows 使用 `%APPDATA%\artinchip-flash`，macOS 使用 `~/Library/Application Support/artinchip-flash`，Linux 使用 `$XDG_CONFIG_HOME/artinchip-flash`（默认 `~/.config/artinchip-flash`）。可导入已有的 `AiBurn.ini`。
 
-`artinchip-flash update` 查询最新的 SemVer 稳定版。可用 `--channel nightly` 查看每日构建通道，`--open` 在有更新时打开下载页，`--json` 输出机器可读结果。有新版时 CLI 退出码为 `10`。更新时替换便携包或重新运行对应安装包。应用不会自动替换自身程序文件。
+`artinchip-flash update` 查询 `boa-z/artinchip-flash` 已发布的 SemVer 稳定版。`--channel nightly` 将本地提交与发布元数据中的 SHA 比较。JSON 状态包括 `available`、`current`、`local_newer`、`no_release` 和 `unknown`，仅 `available` 返回 `10`。API 失败返回 `1`，并区分网络/TLS、认证和限流。成功检查后会输出发行页面。`--open` 在有更新时尝试启动浏览器，无头环境可直接使用输出的链接。更新时替换便携包或重新运行对应安装包。
 
 ## 常见问题
 
 - 扫描不到 USB 设备时，确认升级模式和 USB 权限，并尝试更换直连数据线。用 `artinchip-flash env-check` 检查访问权限和冲突服务。
 - 串口握手失败时，核对控制台端口、波特率和开发板供电，关闭占用端口的其他终端程序后重试。
-- 烧录失败时，核对镜像与板型及介质是否匹配。用 `--verbose` 查看传输细节。可用 `burn --log-file FILE` 收集事件，或在开始烧录前启用 GUI 的 JSON 事件记录。
+- 烧录失败时，核对镜像与板型及介质是否匹配。用 `--verbose` 查看传输细节。`burn --log-file FILE` 新建 NDJSON 日志，记录阶段和最终结果，失败或取消时也会保存。`--progress plain` 按里程碑换行，`--progress off` 隐藏进度计数。`--json` 始终输出 NDJSON。字段和退出码见 [CLI 契约](reference.md#cli-契约)。

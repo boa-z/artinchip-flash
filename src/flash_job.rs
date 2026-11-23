@@ -1,12 +1,14 @@
 //! Firmware preparation and native burn orchestration shared by both frontends.
 
 use std::path::PathBuf;
+use std::time::Instant;
 
 use artinchip_flash::{FirmwareImage, FlashError, PreparedFlash};
 
-use crate::device::{validate_erase_plan, BurnEvent, BurnOptions};
+use crate::device::{validate_erase_plan, BurnEvent, BurnOptions, BurnReport, UpgDevice};
 use crate::official;
 use crate::services::DeviceTarget;
+use crate::transport::UpgTransport;
 use crate::usb::device::{AicDevice, DeviceSelector};
 
 pub fn prepare(
@@ -55,7 +57,16 @@ pub struct FlashJob<'job, 'image> {
 }
 
 impl FlashJob<'_, '_> {
-    pub fn run(self, mut emit: impl FnMut(JobEvent) + Send) -> Result<(), JobError> {
+    pub fn run(self, emit: impl FnMut(JobEvent) + Send) -> Result<(), JobError> {
+        self.run_reported(&mut BurnReport::default(), emit)
+    }
+
+    pub fn run_reported(
+        self,
+        report: &mut BurnReport,
+        mut emit: impl FnMut(JobEvent) + Send,
+    ) -> Result<(), JobError> {
+        *report = BurnReport::default();
         self.flash.check_cancelled().map_err(JobError::Upgrade)?;
         let target = match &self.erase {
             Some(erase) => {
@@ -66,7 +77,7 @@ impl FlashJob<'_, '_> {
                         erase.tool.display()
                     )));
                 }
-                pin_erase_target(self.target).map_err(JobError::PreErase)?
+                pin_erase_target(self.target).map_err(JobError::Connect)?
             }
             None => self.target,
         };
@@ -74,12 +85,21 @@ impl FlashJob<'_, '_> {
         self.flash.check_cancelled().map_err(JobError::Upgrade)?;
         if !self.report_device_info {
             emit(JobEvent::Output(target.label()));
+        } else {
+            emit(JobEvent::Progress(BurnEvent::Stage(
+                "Connect to target".into(),
+            )));
         }
-        let mut device = target.open().map_err(JobError::Connect)?;
+        let mut device = Self::open(self.flash, &target, report)?;
         if let Some(erase) = self.erase {
             let stage = device
                 .verify_upgrade_stage(self.flash.options().no_updater)
-                .map_err(JobError::PreErase)?;
+                .map_err(|message| {
+                    JobError::Upgrade(FlashError::Device {
+                        operation: "verify upgrade stage before erase",
+                        message,
+                    })
+                })?;
             emit(JobEvent::Output(stage));
             let media_type = self.flash.header().media_type_str();
             let media_id = erase
@@ -95,7 +115,12 @@ impl FlashJob<'_, '_> {
                 })?;
             if !device
                 .list_storage_media()
-                .map_err(JobError::PreErase)?
+                .map_err(|message| {
+                    JobError::Upgrade(FlashError::Device {
+                        operation: "query storage media before erase",
+                        message,
+                    })
+                })?
                 .iter()
                 .any(|entry| entry.media_dev_id == media_id && entry.media_type == media_type)
             {
@@ -125,7 +150,12 @@ impl FlashJob<'_, '_> {
             .map_err(|error| JobError::PreErase(format!("Pre-burn erase failed: {error}")))?;
             emit(JobEvent::Output(output));
             self.flash.check_cancelled().map_err(JobError::Upgrade)?;
-            device = target.open().map_err(JobError::Connect)?;
+            if self.report_device_info {
+                emit(JobEvent::Progress(BurnEvent::Stage(
+                    "Reconnect after pre-burn erase".into(),
+                )));
+            }
+            device = Self::open(self.flash, &target, report)?;
         }
         self.flash.check_cancelled().map_err(JobError::Upgrade)?;
         if self.report_device_info {
@@ -142,12 +172,29 @@ impl FlashJob<'_, '_> {
                 ))),
             }
         }
-        self.flash
+        let result = self
+            .flash
             .execute(
                 &mut device,
                 Some(&mut |event| emit(JobEvent::Progress(event))),
             )
-            .map_err(JobError::Upgrade)
+            .map_err(JobError::Upgrade);
+        let connection_time = report.connection_time;
+        *report = device.burn_report().clone();
+        report.connection_time = connection_time;
+        result
+    }
+
+    fn open(
+        flash: &PreparedFlash<'_>,
+        target: &DeviceTarget,
+        report: &mut BurnReport,
+    ) -> Result<UpgDevice<Box<dyn UpgTransport>>, JobError> {
+        let started = Instant::now();
+        let result = target.open();
+        report.connection_time += started.elapsed();
+        flash.check_cancelled().map_err(JobError::Upgrade)?;
+        result.map_err(JobError::Connect)
     }
 }
 

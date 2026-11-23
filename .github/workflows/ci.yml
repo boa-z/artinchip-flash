@@ -14,16 +14,48 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-24.04, macos-latest]
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
 
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
       - name: Install repository Rust toolchain
-        run: rustup show
+        shell: bash
+        run: |
+          toolchain="$(awk -F\" '/^channel =/ { print $2; exit }' rust-toolchain.toml)-${{ matrix.target }}"
+          rustup toolchain install "$toolchain" --profile minimal --component rustfmt --component clippy
+          printf 'RUSTUP_TOOLCHAIN=%s\n' "$toolchain" >> "$GITHUB_ENV"
+
+      - name: Validate version and select build channel
+        shell: bash
+        env:
+          HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          version="$(awk -F\" '/^version =/ { print $2; exit }' Cargo.toml)"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          channel=development
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            test "$GITHUB_REF_NAME" = "v$version"
+            channel=stable
+          elif [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF" == refs/heads/main && "$HEAD_COMMIT_MESSAGE" != *'[skip nightly]'* ]]; then
+            channel=nightly
+          fi
+          printf 'ARTINCHIP_FLASH_CHANNEL=%s\nARTINCHIP_FLASH_VERSION=%s\n' "$channel" "$version" >> "$GITHUB_ENV"
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
@@ -99,7 +131,10 @@ jobs:
         run: |
           $system = "windows-$($env:RUNNER_ARCH.ToLower())"
           $archive = "artinchip-flash-$system.zip"
-          $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches.Groups[1].Value
+          $version = $env:ARTINCHIP_FLASH_VERSION
+          $repository = (Select-String -Path Cargo.toml -Pattern '^repository\s*=\s*"([^"]+)"').Matches.Groups[1].Value
+          $arch = $env:RUNNER_ARCH.ToLower()
+          $msiArch = if ($arch -eq 'arm64') { 'arm64' } else { 'x86' }
           New-Item -ItemType Directory -Force packages, dist | Out-Null
 
           Copy-Item target/release/artinchip-flash.exe "dist/artinchip-flash-$system.exe"
@@ -123,8 +158,9 @@ jobs:
           if ((Get-FileHash -Algorithm SHA512 $source).Hash -ne $checksum) { throw 'libusb source checksum mismatch' }
           Copy-Item "$installed/share/libusb/copyright" libusb-sources/COPYING
           Compress-Archive -Path libusb-sources/* -DestinationPath dist/libusb-source.zip -Force
-          & "./dist/artinchip-flash-$system.exe" --version
-          if ($LASTEXITCODE -ne 0) { throw 'Portable CLI cannot load its runtime dependencies' }
+          $cliVersion = & "./dist/artinchip-flash-$system.exe" --version
+          if ($LASTEXITCODE -ne 0 -or $cliVersion[0] -ne "artinchip-flash $version" -or
+              $cliVersion -notcontains "channel: $env:ARTINCHIP_FLASH_CHANNEL") { throw 'Unexpected CLI build metadata' }
           Compress-Archive -Path dist/* -DestinationPath "packages/$archive" -Force
 
           dotnet tool install --global wix --version 5.0.2
@@ -136,12 +172,12 @@ jobs:
               <MediaTemplate EmbedCab="yes" />
               <Property Id="ARPCOMMENTS" Value="Cross-platform CLI and GUI flasher for ArtInChip SoCs." />
               <Property Id="ARPCONTACT" Value="boa-w" />
-              <Property Id="ARPURLINFOABOUT" Value="https://github.com/boa-w/artinchip-flash" />
+              <Property Id="ARPURLINFOABOUT" Value="$repository" />
               <Icon Id="ArtInChipFlashIcon" SourceFile="assets\artinchip-flash.ico" />
               <Property Id="ARPPRODUCTICON" Value="ArtInChipFlashIcon" />
               <Property Id="ARPNOMODIFY" Value="1" />
 
-              <StandardDirectory Id="ProgramFilesFolder">
+              <StandardDirectory Id="ProgramFiles6432Folder">
                 <Directory Id="INSTALLFOLDER" Name="artinchip-flash" />
               </StandardDirectory>
 
@@ -197,10 +233,11 @@ jobs:
             </Package>
           </Wix>
           "@ | Set-Content -Path installer.wxs -Encoding UTF8
-          wix build installer.wxs -o "packages/artinchip-flash-$system.msi"
+          wix build -arch $msiArch installer.wxs -o "packages/artinchip-flash-$system.msi"
           if ($LASTEXITCODE -ne 0) { throw 'WiX build failed' }
           Remove-Item -Path packages/*.wixpdb -ErrorAction SilentlyContinue
 
+          if ($arch -eq 'x64') {
           choco install innosetup --version=6.2.2 --allow-downgrade --no-progress -y
           if ($LASTEXITCODE -ne 0) { throw 'Inno Setup installation failed' }
           @"
@@ -211,10 +248,11 @@ jobs:
           AppId={{6E258C67-9E5F-48FD-BE41-4F53565B76ED}
           AppName={#AppName}
           AppVersion={#AppVersion}
+          VersionInfoVersion=$version
           AppPublisher=boa-w
-          AppPublisherURL=https://github.com/boa-w/artinchip-flash
-          AppSupportURL=https://github.com/boa-w/artinchip-flash
-          AppUpdatesURL=https://github.com/boa-w/artinchip-flash/releases/tag/nightly
+          AppPublisherURL=$repository
+          AppSupportURL=$repository
+          AppUpdatesURL=$repository/releases
           DefaultDirName={autopf}\artinchip-flash
           DefaultGroupName=artinchip-flash ArtInChip Flasher
           DisableProgramGroupPage=yes
@@ -252,20 +290,38 @@ jobs:
             iscc installer.iss
           }
           if ($LASTEXITCODE -ne 0) { throw 'Inno Setup build failed' }
+          }
 
           $msi = (Resolve-Path "packages/artinchip-flash-$system.msi").Path
+          $installer = New-Object -ComObject WindowsInstaller.Installer
+          $db = $installer.GetType().InvokeMember("OpenDatabase", "InvokeMethod", $null, $installer, @($msi, 0))
+          $query = 'SELECT `Value` FROM `Property` WHERE `Property` = ''ProductVersion'''
+          $view = $db.GetType().InvokeMember("OpenView", "InvokeMethod", $null, $db, @($query))
+          $view.GetType().InvokeMember("Execute", "InvokeMethod", $null, $view, $null) | Out-Null
+          $row = $view.GetType().InvokeMember("Fetch", "InvokeMethod", $null, $view, $null)
+          if ($row.GetType().InvokeMember("StringData", "GetProperty", $null, $row, @(1)) -ne $version) {
+            throw 'Unexpected MSI product version'
+          }
           $msiRoot = Join-Path (Get-Location) 'verified-msi'
           $extract = Start-Process msiexec.exe -ArgumentList "/a `"$msi`" /qn TARGETDIR=`"$msiRoot`"" -Wait -PassThru
           if ($extract.ExitCode -ne 0) { throw "MSI extraction failed ($($extract.ExitCode))" }
-          Invoke-WebRequest 'https://constexpr.org/innoextract/files/innoextract-1.9-windows.zip' -OutFile innoextract.zip
-          Expand-Archive innoextract.zip -DestinationPath innoextract-bin
-          $inno = (Get-ChildItem innoextract-bin -Recurse -Filter innoextract.exe | Select-Object -First 1).FullName
-          & $inno --extract --output-dir verified-inno "packages/artinchip-flash-$system-setup.exe"
-          if ($LASTEXITCODE -ne 0) { throw 'Inno Setup extraction failed' }
           Expand-Archive "packages/$archive" -DestinationPath verified-portable
           $msiPayload = (Get-ChildItem verified-msi -Recurse -Filter artinchip-flash.exe | Select-Object -First 1).Directory.FullName
-          $innoPayload = (Get-ChildItem verified-inno -Recurse -Filter artinchip-flash.exe | Select-Object -First 1).Directory.FullName
-          foreach ($payload in 'verified-portable', $msiPayload, $innoPayload) {
+          $payloads = @('verified-portable', $msiPayload)
+          if ($arch -eq 'x64') {
+            $setup = "packages/artinchip-flash-$system-setup.exe"
+            $setupVersion = (Get-Item $setup).VersionInfo
+            if ("$($setupVersion.FileMajorPart).$($setupVersion.FileMinorPart).$($setupVersion.FileBuildPart)" -ne $version) {
+              throw 'Unexpected setup EXE file version'
+            }
+            Invoke-WebRequest 'https://constexpr.org/innoextract/files/innoextract-1.9-windows.zip' -OutFile innoextract.zip
+            Expand-Archive innoextract.zip -DestinationPath innoextract-bin
+            $inno = (Get-ChildItem innoextract-bin -Recurse -Filter innoextract.exe | Select-Object -First 1).FullName
+            & $inno --extract --output-dir verified-inno $setup
+            if ($LASTEXITCODE -ne 0) { throw 'Inno Setup extraction failed' }
+            $payloads += (Get-ChildItem verified-inno -Recurse -Filter artinchip-flash.exe | Select-Object -First 1).Directory.FullName
+          }
+          foreach ($payload in $payloads) {
             foreach ($file in 'LICENSE', 'NOTICE', 'THIRD-PARTY-LICENSES.txt', 'libusb-source.zip', 'libusb-1.0.dll') {
               if ((Get-FileHash "$payload/$file").Hash -ne (Get-FileHash "dist/$file").Hash) { throw "$file differs in $payload" }
             }
@@ -273,32 +329,38 @@ jobs:
 
       - name: Package Linux artifacts
         if: runner.os == 'Linux'
-        run: bash scripts/package_linux.sh
+        run: |
+          arch="$(dpkg --print-architecture)"
+          system="linux-${arch/amd64/x64}"
+          bash scripts/package_linux.sh
+          bash scripts/check_linux_cli.sh target/release/artinchip-flash "packages/artinchip-flash-cli-$system.deb"
 
-      - name: Verify Linux CLI runtime dependencies
+      - name: Test Debian 13 installation and package switching
         if: runner.os == 'Linux'
         run: |
-          bash scripts/check_linux_cli.sh target/release/artinchip-flash packages/artinchip-flash-cli-linux-x64.deb
-
-      - name: Test Debian 13 installation, non-AVX startup and package switching
-        if: runner.os == 'Linux'
-        run: |
-          docker run --rm --mount "type=bind,src=$PWD/packages,dst=/packages,readonly" debian:13-slim bash -euc '
+          docker run --rm -e ARTINCHIP_FLASH_VERSION --mount "type=bind,src=$PWD/packages,dst=/packages,readonly" debian:13-slim bash -euc '
             export DEBIAN_FRONTEND=noninteractive
-            cli=/packages/artinchip-flash-cli-linux-x64.deb
-            full=/packages/artinchip-flash-linux-x64.deb
+            set -o pipefail
+            arch="$(dpkg --print-architecture)"
+            system="linux-${arch/amd64/x64}"
+            cli="/packages/artinchip-flash-cli-$system.deb"
+            full="/packages/artinchip-flash-$system.deb"
             apt-get update
             apt-get install -y --no-install-recommends "$cli"
-            artinchip-flash --help
-            artinchip-flash --version
             test -f /usr/lib/udev/rules.d/99-artinchip-flash.rules
             test ! -e /usr/bin/artinchip-flash-gui
             if dpkg-query -W -f="\${db:Status-Abbrev} \${Package}\n" | grep -E "^ii +lib(x11|xcb|wayland|gl|egl|vulkan|llvm)"; then
               exit 1
             fi
-            apt-get install -y --no-install-recommends qemu-user
-            timeout --kill-after=5s 30s qemu-x86_64 -cpu Nehalem /usr/bin/artinchip-flash --help
-            timeout --kill-after=5s 30s qemu-x86_64 -cpu Nehalem /usr/bin/artinchip-flash --version
+            if [[ "$arch" == amd64 ]]; then
+              apt-get install -y --no-install-recommends qemu-user
+              cli_command=(timeout 30s qemu-x86_64 -cpu Nehalem /usr/bin/artinchip-flash)
+              "${cli_command[@]}" --help >/dev/null
+              "${cli_command[@]}" --version | grep -Fx "artinchip-flash $ARTINCHIP_FLASH_VERSION"
+              "${cli_command[@]}" scan --json | grep -Fx "{\"devices\":[]}"
+            else
+              artinchip-flash --version | grep -Fx "artinchip-flash $ARTINCHIP_FLASH_VERSION"
+            fi
             apt-get install -y --no-install-recommends "$full"
             test -x /usr/bin/artinchip-flash-gui
             test -f /usr/share/applications/artinchip-flash-gui.desktop
@@ -319,7 +381,9 @@ jobs:
         run: |
           system="$(printf '%s-%s' "$RUNNER_OS" "$RUNNER_ARCH" | tr '[:upper:]' '[:lower:]')"
           archive="artinchip-flash-${system}.tar.gz"
-          version="$(awk -F\" '/^version =/ { print $2; exit }' Cargo.toml)"
+          version="$ARTINCHIP_FLASH_VERSION"
+          target/release/artinchip-flash --version | grep -Fx "artinchip-flash $version"
+          target/release/artinchip-flash --version | grep -Fx "channel: $ARTINCHIP_FLASH_CHANNEL"
           mkdir -p packages dist
           cp target/release/artinchip-flash "dist/artinchip-flash-${system}"
           cp target/release/artinchip-flash-gui "dist/artinchip-flash-gui-${system}"
@@ -366,7 +430,11 @@ jobs:
           pkgbuild --root "$pkgroot" --identifier "com.boaw.artinchip-flash" --version "$version" --install-location / "packages/artinchip-flash-${system}.pkg"
           otool -L target/release/artinchip-flash | grep -F 'libusb-1.0.0.dylib'
           pkgutil --expand-full "packages/artinchip-flash-${system}.pkg" verified-pkg
-          plutil -lint verified-pkg/Payload/Applications/artinchip-flash-gui.app/Contents/Info.plist
+          plist=verified-pkg/Payload/Applications/artinchip-flash-gui.app/Contents/Info.plist
+          plutil -lint "$plist"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")" = "$version"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist")" = "$version"
+          test "$(xmllint --xpath 'string(/pkg-info/@version)' verified-pkg/PackageInfo)" = "$version"
           for file in LICENSE NOTICE THIRD-PARTY-LICENSES.txt; do
             tar -xOf "packages/$archive" "./$file" | cmp "$file" -
             cmp "$file" "verified-pkg/Payload/Applications/artinchip-flash-gui.app/Contents/Resources/$file"
@@ -374,7 +442,7 @@ jobs:
           done
 
       - name: Upload packaged artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: artinchip-flash-${{ runner.os }}-${{ runner.arch }}-packages
           path: packages/*
@@ -387,65 +455,24 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && !contains(github.event.head_commit.message, '[skip nightly]')
     permissions:
       contents: write
+    concurrency:
+      group: nightly-release
 
     steps:
       - name: Download packaged artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           path: release-assets
           merge-multiple: true
 
-      - name: Move nightly tag to current commit
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const tag = 'nightly';
-            try {
-              await github.rest.git.deleteRef({ owner, repo, ref: `tags/${tag}` });
-            } catch (error) {
-              if (error.status !== 404 && error.status !== 422) throw error;
-            }
-            await github.rest.git.createRef({
-              owner,
-              repo,
-              ref: `refs/tags/${tag}`,
-              sha: context.sha,
-            });
-
-      - name: Remove previous nightly assets
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            try {
-              const release = await github.rest.repos.getReleaseByTag({
-                owner,
-                repo,
-                tag: 'nightly',
-              });
-              for (const asset of release.data.assets) {
-                await github.rest.repos.deleteReleaseAsset({
-                  owner,
-                  repo,
-                  asset_id: asset.id,
-                });
-              }
-            } catch (error) {
-              if (error.status !== 404) throw error;
-            }
-
       - name: Publish nightly release
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         env:
           ASSET_DIR: release-assets
         with:
           script: |
             const fs = require('fs');
             const path = require('path');
-
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const tag = 'nightly';
@@ -455,30 +482,38 @@ jobs:
               'Portable archives and native installers are named as `artinchip-flash-<system>`.',
               'For headless Linux x86-64, use `artinchip-flash-cli-linux-x64.deb`.',
             ].join('\n');
+            const current = (await github.rest.git.getRef({ owner, repo, ref: 'heads/main' })).data.object.sha;
+            if (current !== context.sha) {
+              core.notice('A newer main commit superseded this build.');
+              return;
+            }
 
-            let release;
+            const releases = await github.paginate(github.rest.repos.listReleases, { owner, repo, per_page: 100 });
+            let release = releases.find(release => release.tag_name === tag);
+            if (!release) {
+              release = (await github.rest.repos.createRelease({
+                owner, repo, tag_name: tag, target_commitish: context.sha,
+                name: 'artinchip-flash nightly', draft: true, prerelease: true, make_latest: 'false',
+              })).data;
+            } else {
+              await github.rest.repos.updateRelease({
+                owner, repo, release_id: release.id, body: 'Nightly assets are being refreshed.',
+              });
+            }
+            const assets = await github.paginate(github.rest.repos.listReleaseAssets, {
+              owner, repo, release_id: release.id, per_page: 100,
+            });
+            for (const asset of assets) {
+              await github.rest.repos.deleteReleaseAsset({ owner, repo, asset_id: asset.id });
+            }
             try {
-              release = await github.rest.repos.getReleaseByTag({ owner, repo, tag });
-              release = await github.rest.repos.updateRelease({
-                owner,
-                repo,
-                release_id: release.data.id,
-                name: 'artinchip-flash nightly',
-                body,
-                prerelease: true,
-                make_latest: 'false',
+              await github.rest.git.updateRef({
+                owner, repo, ref: `tags/${tag}`, sha: context.sha, force: true,
               });
             } catch (error) {
-              if (error.status !== 404) throw error;
-              release = await github.rest.repos.createRelease({
-                owner,
-                repo,
-                tag_name: tag,
-                target_commitish: context.sha,
-                name: 'artinchip-flash nightly',
-                body,
-                prerelease: true,
-                make_latest: 'false',
+              if (error.status !== 404 && error.status !== 422) throw error;
+              await github.rest.git.createRef({
+                owner, repo, ref: `refs/tags/${tag}`, sha: context.sha,
               });
             }
 
@@ -489,7 +524,7 @@ jobs:
               await github.rest.repos.uploadReleaseAsset({
                 owner,
                 repo,
-                release_id: release.data.id,
+                release_id: release.id,
                 name: file,
                 data: fs.readFileSync(fullPath),
                 headers: {
@@ -498,6 +533,9 @@ jobs:
                 },
               });
             }
+            await github.rest.repos.updateRelease({
+              owner, repo, release_id: release.id, body, draft: false, prerelease: true, make_latest: 'false',
+            });
 
   release:
     name: publish-release
@@ -506,16 +544,18 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
+    concurrency:
+      group: versioned-release-${{ github.ref }}
 
     steps:
       - name: Download packaged artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           path: release-assets
           merge-multiple: true
 
       - name: Publish versioned release
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         env:
           ASSET_DIR: release-assets
         with:
@@ -534,11 +574,16 @@ jobs:
               'The in-app updater (`artinchip-flash update`, GUI Settings) treats these `v*` tags as the stable channel.',
             ].join('\n');
 
-            let release;
-            try {
-              release = await github.rest.repos.getReleaseByTag({ owner, repo, tag });
-            } catch (error) {
-              if (error.status !== 404) throw error;
+            const releases = await github.paginate(github.rest.repos.listReleases, { owner, repo, per_page: 100 });
+            let release = releases.find(release => release.tag_name === tag);
+            if (release && !release.draft) {
+              core.notice(`Published ${tag} already exists. Keeping its original assets.`);
+              return;
+            }
+            if (release && !release.body?.startsWith(body.split('\n')[0])) {
+              throw new Error(`Draft ${tag} does not belong to this commit`);
+            }
+            if (!release) {
               release = await github.rest.repos.createRelease({
                 owner,
                 repo,
@@ -547,18 +592,24 @@ jobs:
                 name: `artinchip-flash ${tag}`,
                 body,
                 prerelease: false,
-                make_latest: 'true',
-              });
+                draft: true,
+              }).then(response => response.data);
             }
 
             const assetDir = process.env.ASSET_DIR;
+            const assets = await github.paginate(github.rest.repos.listReleaseAssets, {
+              owner, repo, release_id: release.id, per_page: 100,
+            });
+            for (const asset of assets) {
+              await github.rest.repos.deleteReleaseAsset({ owner, repo, asset_id: asset.id });
+            }
             for (const file of fs.readdirSync(assetDir)) {
               const fullPath = path.join(assetDir, file);
               if (!fs.statSync(fullPath).isFile()) continue;
               await github.rest.repos.uploadReleaseAsset({
                 owner,
                 repo,
-                release_id: release.data.id,
+                release_id: release.id,
                 name: file,
                 data: fs.readFileSync(fullPath),
                 headers: {
@@ -567,3 +618,6 @@ jobs:
                 },
               });
             }
+            await github.rest.repos.updateRelease({
+              owner, repo, release_id: release.id, draft: false, make_latest: 'true',
+            });

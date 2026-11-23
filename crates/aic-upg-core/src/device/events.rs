@@ -1,5 +1,27 @@
 use std::time::Duration;
 
+#[derive(Clone, Debug, Default)]
+pub struct BurnReport {
+    pub bytes_sent: usize,
+    pub transfer_time: Duration,
+    pub connection_time: Duration,
+    pub reconnect_time: Duration,
+    pub components_completed: usize,
+    pub device_crcs_verified: usize,
+    pub upgrade_ended: bool,
+    pub reset: ResetOutcome,
+}
+
+#[derive(Clone, Debug, Default)]
+pub enum ResetOutcome {
+    #[default]
+    NotAttempted,
+    Skipped,
+    Acknowledged,
+    Unconfirmed(String),
+    Failed(String),
+}
+
 #[derive(Clone, Debug)]
 /// Progress reported synchronously during an upgrade.
 pub enum BurnEvent {

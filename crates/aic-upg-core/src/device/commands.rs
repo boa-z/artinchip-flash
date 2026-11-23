@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use super::events::{BurnReport, ResetOutcome};
 use crate::log_verbose;
 use crate::protocol::cbw_csw::*;
 use crate::protocol::commands::*;
@@ -23,12 +24,21 @@ pub(super) struct UpgResponse {
 /// transactions between host and device.
 pub struct UpgDevice<T: UpgTransport> {
     pub(super) transport: T,
+    pub(super) burn_report: BurnReport,
 }
 
 impl<T: UpgTransport> UpgDevice<T> {
     /// Bind a transport to the UPG command client.
     pub fn new(transport: T) -> Self {
-        Self { transport }
+        Self {
+            transport,
+            burn_report: BurnReport::default(),
+        }
+    }
+
+    /// Measurements and outcomes from the most recent prepared upgrade attempt.
+    pub fn burn_report(&self) -> &BurnReport {
+        &self.burn_report
     }
 
     /// Return the diagnostic name supplied by the transport.
@@ -49,6 +59,7 @@ impl<T: UpgTransport> UpgDevice<T> {
     {
         UpgDevice {
             transport: Box::new(self.transport),
+            burn_report: self.burn_report,
         }
     }
 
@@ -332,6 +343,24 @@ impl<T: UpgTransport> UpgDevice<T> {
     /// Ask the bootloader to reset the device.
     pub fn reset(&mut self) -> Result<(), String> {
         self.run_shell("reset")
+    }
+
+    pub(super) fn reset_for_burn(&mut self) -> ResetOutcome {
+        let payload = match shell_request("reset") {
+            Ok(payload) => payload,
+            Err(error) => return ResetOutcome::Failed(error),
+        };
+        if let Err(error) = self.send_hdr(CMD_RUN_SHELL_STR, payload.len() as u32) {
+            return ResetOutcome::Failed(error);
+        }
+        let response = self
+            .transport
+            .write_txn(&payload, CswPolicy::Required)
+            .and_then(|_| self.read_upg_response(CMD_RUN_SHELL_STR, 0, CswPolicy::Required));
+        match response {
+            Ok(_) => ResetOutcome::Acknowledged,
+            Err(error) => ResetOutcome::Unconfirmed(error),
+        }
     }
 
     /// Query the legacy storage-media text response.

@@ -27,11 +27,13 @@ cargo check --locked -p artinchip-flash --no-default-features --features uart
 python3 scripts/check_sdk_consumer.py
 ```
 
-在 Linux x86-64 上，运行 `qemu-x86_64 -cpu Nehalem target/release/artinchip-flash --help`，再用同一命令运行 `--version`，即可在无 AVX 的 CPU 模型下测试发布版 CLI。CI 检查 `ldd` 和 CLI DEB 的 `Depends`，并在 Debian 13 上验证安装、QEMU 下的 CLI 启动、Xvfb 下的 GUI 启动和包切换。更新检查使用 Rustls、ring 和系统证书库。
+在 Linux x86-64 上，CI 使用 `qemu-x86_64 -cpu Nehalem` 运行发布版 CLI 的 `--help`、`--version` 和 `scan --json`。CI 检查 `ldd` 和 CLI DEB 的 `Depends`，并在 Debian 13 上验证安装、Xvfb 下的 GUI 启动和包切换。更新检查使用 Rustls、ring 和系统证书库。
 
 测试使用合成镜像和脚本化传输，覆盖固定协议向量、固件校验、命令顺序、故障处理和 CLI 输出。外部 SDK 检查会构建一个独立 Cargo 项目，确认其依赖不含 USB、UART 或 GUI，再通过公共 API 执行模拟分区升级。
 
 ## 硬件验证
+
+Debian 13 x86-64 上的非 AVX Intel Celeron N3160 已通过 CLI 启动实测。Intel macOS、Windows arm64 和 Linux arm64 由 GitHub 托管 runner 构建和测试，这三个版本尚未在实机上测试。
 
 D213 硬件验证待执行。使用可恢复的开发板和已知可用的固件。记录主机系统和构建 SHA、板卡和 Bootloader 版本、存储介质及固件 SHA-256。保存离线计划、退出码、事件日志及串口输出。
 
@@ -42,7 +44,7 @@ D213 硬件验证待执行。使用可恢复的开发板和已知可用的固件
 
 ## 发版
 
-更新根目录 `Cargo.toml` 版本和 `Cargo.lock`，为发布提交创建 `vX.Y.Z` 标签。推送标签会触发 Windows、Linux 和 macOS 的构建与发布流程。推送到 `main` 会刷新 `nightly`，提交说明带 `[skip nightly]` 时跳过刷新。
+更新根目录的应用 `Cargo.toml` 版本和 `Cargo.lock`。SDK 独立管理版本。CI 要求标签精确对应 `v` 加应用版本，并在该构建中嵌入 `stable` 渠道。推送到 `main` 时构建 `nightly` 并刷新附件，提交说明带 `[skip nightly]` 时跳过刷新。其他构建使用 `development`。`--version` 显示提交、目标和渠道，已跟踪文件有修改时构建标识可带 `-dirty` 后缀。稳定版先将附件上传到草稿，上传完成后发布，重跑时保留已有正式发行附件。
 
 ## 授权与来源
 

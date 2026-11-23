@@ -6,6 +6,8 @@
 
 Download your platform's package from [GitHub Releases](https://github.com/boa-z/artinchip-flash/releases). The Windows setup EXE and MSI and the macOS arm64 PKG install both the CLI and GUI. Use the Windows ZIP or macOS tar.gz for portable use. Unsigned Windows and macOS installers may trigger system security prompts.
 
+Additional CI builds produce Windows arm64 MSI and ZIP, Intel macOS PKG and tar.gz, and Linux arm64 DEBs and tar.gz. These variants await physical hardware testing.
+
 On Windows, **Tools → Driver** or `artinchip-flash install-usb-access` can install the WinUSB binding for `33c3:6677` with administrator privileges. On Linux, the same command installs the udev rule for non-root access. Reconnect the board after installation. macOS generally requires no kernel driver. If opening the device succeeds but transfers time out, close other USB tools and reconnect. In `scan --json`, `enumerated`, `ioreg_ready` and `protocol_ready` distinguish USB discovery, macOS descriptor readiness and a successful UPG probe.
 
 ### Linux installation
@@ -71,10 +73,10 @@ Use `--baud` to set the initial baud rate (115200 by default) and `--speed` to n
 
 **Settings** controls language, theme, updates and statistics. `config.ini`, `img_history.txt` and `burn_stats.json` are stored under `%APPDATA%\artinchip-flash` on Windows, `~/Library/Application Support/artinchip-flash` on macOS, or `$XDG_CONFIG_HOME/artinchip-flash` (`~/.config/artinchip-flash` by default) on Linux. An existing `AiBurn.ini` can be imported for compatibility.
 
-`artinchip-flash update` uses the latest stable SemVer release. `--channel nightly` opens access to nightly builds, `--open` opens the download page when an update is available, and `--json` produces machine-readable output. The CLI exits with `10` when a newer version is found. Install updates by replacing the portable package or running the matching installer again. The application does not replace its own binaries.
+`artinchip-flash update` checks published stable SemVer releases on `boa-z/artinchip-flash`. `--channel nightly` compares the local commit with the SHA in the published build metadata. JSON reports `available`, `current`, `local_newer`, `no_release` or `unknown`. Only `available` returns `10`. API failures return `1` and distinguish network/TLS, authentication and rate limiting. The output always provides the release page after a successful check. `--open` tries to launch a browser when an update is available and prints the link as a fallback on a headless system. Install updates by replacing the portable package or running the matching installer again.
 
 ## Troubleshooting
 
 - For a missing USB device, verify upgrade mode, check USB permissions and try a direct data cable. Run `artinchip-flash env-check` for access and conflicting-service diagnostics.
 - For a UART handshake failure, confirm the console port, baud rate and board power. Release the port from other terminal programs before retrying.
-- For a failed burn, verify the image matches the board and storage medium. Use `--verbose` for transport details. To collect events, use `burn --log-file FILE`, or enable JSON event capture in the GUI before the burn.
+- For a failed burn, verify the image matches the board and storage medium. Use `--verbose` for transport details. `burn --log-file FILE` creates a new NDJSON log with phases and the final result, including on failure or cancellation. `--progress plain` uses milestone lines and `--progress off` suppresses the progress counters. `--json` emits NDJSON independently of terminal settings. See the [CLI contract](reference.md#cli-contract) for fields and exit codes.

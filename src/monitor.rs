@@ -191,12 +191,18 @@ fn resolve_monitor_port(path: &str) -> Result<String, String> {
         return Ok(path.to_string());
     }
     let ports = UartDevice::list_ports()?;
-    ports
+    let usb: Vec<_> = ports
         .iter()
-        .find(|port| port.port_type == "usb")
-        .or_else(|| ports.first())
-        .map(|port| port.port_name.clone())
-        .ok_or_else(|| "No serial port found".to_string())
+        .filter(|port| port.port_type == "usb")
+        .collect();
+    match (usb.as_slice(), ports.as_slice()) {
+        ([port], _) => Ok(port.port_name.clone()),
+        ([], [port]) => Ok(port.port_name.clone()),
+        ([], []) => Err("No serial port found".into()),
+        _ => Err(
+            "Multiple serial ports found. Run serial-list and pass a port to uart-monitor.".into(),
+        ),
+    }
 }
 
 /// CLI entry point for `uart-monitor`: mirror device output and forward stdin

@@ -25,6 +25,7 @@ struct MockTransport {
     reconnects: usize,
     fail_hwinfo_once: bool,
     fail_command: Option<(u8, &'static str)>,
+    disconnect_on_reset: bool,
     corrupt_crc: bool,
     malformed_response_at: Option<u8>,
     dropped: ReleaseMarker,
@@ -100,6 +101,9 @@ impl UpgTransport for MockTransport {
                 .rev()
                 .find(|payload| payload.starts_with(b"UPGC"))
                 .map(|payload| payload[6]);
+            if self.disconnect_on_reset && command == Some(CMD_RUN_SHELL_STR) {
+                return Err("simulated disconnect before reset response".into());
+            }
             if command.is_some() && command == self.malformed_response_at {
                 header[0] ^= 1;
             }
@@ -323,27 +327,38 @@ fn default_burn_uses_full_disk_mode_and_resets() {
         partition_upgrade: false,
         no_updater: false,
     };
-    let mut dev = UpgDevice::new(MockTransport {
-        writes: 0,
-        reads: 0,
-        panic_on_use: false,
-        max_chunk: 4096,
-        block_size: 512,
-        boot_stage: 0,
-        reconnects: 0,
-        fail_hwinfo_once: false,
-        ..Default::default()
-    });
-    dev.burn_image_with_options(&img, &metas, &options, None)
-        .expect("mock burn must succeed");
-    assert_eq!(
-        dev.transport_mut().upg_modes,
-        vec![UPG_MODE_FULL_DISK_UPGRADE]
-    );
-    assert!(
-        dev.transport_mut().saw_reset,
-        "default burn must reset the device"
-    );
+    for disconnect in [false, true] {
+        let mut dev = mock_device();
+        dev.transport_mut().disconnect_on_reset = disconnect;
+        let mut events = Vec::new();
+        dev.burn_image_with_options(
+            &img,
+            &metas,
+            &options,
+            Some(&mut |event| events.push(event)),
+        )
+        .expect("reset disconnect must preserve a successful burn");
+        assert_eq!(
+            dev.transport_mut().upg_modes,
+            vec![UPG_MODE_FULL_DISK_UPGRADE]
+        );
+        assert!(dev.transport_mut().saw_reset);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, BurnEvent::Finished))
+                .count(),
+            1
+        );
+        let report = dev.burn_report();
+        assert!(report.upgrade_ended);
+        assert_eq!(report.bytes_sent, 2048);
+        assert_eq!(report.components_completed, 2);
+        assert!(matches!(
+            (disconnect, &report.reset),
+            (false, ResetOutcome::Acknowledged) | (true, ResetOutcome::Unconfirmed(_))
+        ));
+    }
 }
 
 #[test]

@@ -29,9 +29,8 @@ artinchip-flash = {{ path = {json.dumps(sdk.as_posix(), ensure_ascii=False)}, de
 """
     (project / "Cargo.toml").write_text(manifest, encoding="utf-8")
     subprocess.run(["cargo", "fmt", "--", "--check"], cwd=project, check=True)
-    subprocess.run(["cargo", "tree", "--offline"], cwd=project, check=True, stdout=subprocess.DEVNULL)
-    tree = subprocess.check_output(["cargo", "tree", "--locked", "--prefix", "none", "--edges", "normal"], cwd=project, text=True)
+    tree = subprocess.check_output(["cargo", "tree", "--offline", "--prefix", "none", "--edges", "normal"], cwd=project, text=True)
     dependencies = {line.split()[0] for line in tree.splitlines() if line}
-    if unexpected := dependencies.intersection({"rusb", "serialport", "egui", "eframe", "rfd", "self_update"}):
+    if unexpected := dependencies.intersection({"rusb", "serialport", "egui", "eframe", "rfd", "ureq", "rustls"}):
         raise SystemExit(f"Unexpected device or GUI dependencies: {sorted(unexpected)}")
     subprocess.run(["cargo", "run", "--locked"], cwd=project, check=True)

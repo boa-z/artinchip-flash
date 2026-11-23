@@ -106,6 +106,11 @@ pub fn image_history_path() -> PathBuf {
 }
 
 pub fn environment_report(image: Option<&Path>) -> String {
+    environment_reports(image).0
+}
+
+pub fn environment_reports(image: Option<&Path>) -> (String, serde_json::Value) {
+    use serde_json::json;
     let mut lines = Vec::new();
     lines.push("artinchip-flash standalone environment check".to_string());
     lines.push(format!("Version: {}", build_info::VERSION));
@@ -114,24 +119,35 @@ pub fn environment_report(image: Option<&Path>) -> String {
     lines.push(format!("Platform: {}", platform_name()));
     lines.push(format!("Config dir: {}", default_app_dir().display()));
 
-    match ensure_app_dir() {
+    let config = match ensure_app_dir() {
         Ok(dir) => {
-            let probe = dir.join(".write-test");
-            match fs::write(&probe, b"ok").and_then(|_| fs::remove_file(&probe)) {
-                Ok(()) => lines.push("Config dir writable: OK".to_string()),
-                Err(e) => lines.push(format!("Config dir writable: FAILED ({})", e)),
-            }
+            let probe = dir.join(format!(".write-test-{}", std::process::id()));
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&probe)
+                .and_then(|file| {
+                    drop(file);
+                    fs::remove_file(&probe)
+                })
+                .map_err(|error| error.to_string())
         }
-        Err(e) => lines.push(format!("Config dir: FAILED ({})", e)),
+        Err(error) => Err(error),
+    };
+    match &config {
+        Ok(()) => lines.push("Config dir writable: OK".to_string()),
+        Err(e) => lines.push(format!("Config dir writable: FAILED ({})", e)),
     }
 
-    match AicDevice::scan_devices() {
+    let mut usb_access = None;
+    let usb = AicDevice::scan_devices();
+    match &usb {
         Ok(devices) if devices.is_empty() => {
             lines.push("USB device: not connected (VID=33C3 PID=6677)".to_string());
         }
         Ok(devices) => {
             lines.push(format!("USB device: {} detected", devices.len()));
-            for device in &devices {
+            for device in devices {
                 lines.push(format!(
                     "  bus={} address={} path={} speed={} enumerated={} ioreg={} protocol={}",
                     device.bus_number,
@@ -154,19 +170,28 @@ pub fn environment_report(image: Option<&Path>) -> String {
                     lines.push(format!("    {}", status));
                 }
             }
-            match AicDevice::open_first() {
-                Ok(_) => lines.push("USB access: OK".to_string()),
-                Err(e) => lines.push(format!("USB access: FAILED ({})", e)),
+            if devices.len() == 1 {
+                usb_access = Some(AicDevice::open_first().map(drop));
+                match &usb_access {
+                    Some(Ok(())) => lines.push("USB access: OK".to_string()),
+                    Some(Err(e)) => lines.push(format!("USB access: FAILED ({})", e)),
+                    None => {}
+                }
+            } else {
+                lines.push(
+                    "USB access: multiple devices, use info --device to test a target".into(),
+                );
             }
         }
         Err(e) => lines.push(format!("USB scan: FAILED ({})", e)),
     }
 
-    match UartDevice::list_ports() {
+    let ports = UartDevice::list_ports();
+    match &ports {
         Ok(ports) if ports.is_empty() => lines.push("Serial ports: none found".to_string()),
         Ok(ports) => {
             lines.push(format!("Serial ports: {} detected", ports.len()));
-            for port in &ports {
+            for port in ports {
                 let usb = match (port.vid, port.pid) {
                     (Some(vid), Some(pid)) => format!(" usb={:04x}:{:04x}", vid, pid),
                     _ => String::new(),
@@ -180,27 +205,44 @@ pub fn environment_report(image: Option<&Path>) -> String {
         Err(e) => lines.push(format!("Serial ports: FAILED ({})", e)),
     }
 
-    if let Some(image) = image {
+    let image_check = if let Some(image) = image {
         match parser::read_image(image) {
-            Ok((_data, _header, metas, summary)) => lines.push(format!(
-                "Image: OK ({} {} v{}, {} components)",
-                summary.platform,
-                summary.product,
-                summary.version,
-                metas.len()
-            )),
-            Err(e) => lines.push(format!("Image: FAILED ({})", e)),
+            Ok((_data, _header, metas, summary)) => {
+                lines.push(format!(
+                    "Image: OK ({} {} v{}, {} components)",
+                    summary.platform,
+                    summary.product,
+                    summary.version,
+                    metas.len()
+                ));
+                json!({"ok":true,"platform":summary.platform,"product":summary.product,"version":summary.version,"components":metas.len()})
+            }
+            Err(e) => {
+                lines.push(format!("Image: FAILED ({})", e));
+                json!({"ok":false,"error":e})
+            }
         }
     } else {
         lines.push("Image: not selected".to_string());
-    }
+        serde_json::Value::Null
+    };
 
     lines.push(driver_help_text().to_string());
     lines.extend(usb_permission_hint().lines().map(str::to_string));
     lines.push(conflicts::report());
     lines.push(burn_stats_hint().to_string());
 
-    lines.join("\n")
+    let structured = json!({
+        "version":build_info::VERSION, "build":build_info::BUILD, "commit":build_info::COMMIT,
+        "target":build_info::TARGET, "channel":build_info::CHANNEL, "platform":platform_name(),
+        "config_dir":default_app_dir(),
+        "config_writable":config.is_ok(), "config_error":config.err(),
+        "usb_device_count":usb.as_ref().ok().map(Vec::len), "usb_scan_error":usb.err(),
+        "usb_accessible":usb_access.as_ref().map(Result::is_ok), "usb_access_error":usb_access.and_then(Result::err),
+        "serial_port_count":ports.as_ref().ok().map(Vec::len), "serial_error":ports.err(),
+        "image":image_check,
+    });
+    (lines.join("\n"), structured)
 }
 
 fn burn_stats_hint() -> &'static str {

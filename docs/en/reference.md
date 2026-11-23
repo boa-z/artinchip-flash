@@ -41,6 +41,40 @@ Use `artinchip-flash <command> --help` for arguments and options. The GUI calls 
 | `sd-list` | Tools → List physical disks (read-only) |
 | `update` | Settings → Check for updates |
 
+## CLI contract
+
+Windows x86-64, Linux x86-64 and macOS arm64 share the commands, option defaults, JSON schemas and exit codes. Platform differences include the native device list, access permissions, path syntax, USB access setup, hardware support and browser launch. Use `serial-list` to find the operating system's port name, such as `COM4`, `/dev/ttyUSB0` or `/dev/cu.usbserial-*`.
+
+| Commands | Output with `--json` | Target selection or platform details |
+| --- | --- | --- |
+| USB discovery (`scan`, `usb-list`) | One object with `devices` | Empty scans succeed. `scan --require-device` exits `3` when empty. USB status fields can be `null` when unavailable. |
+| UART discovery (`serial-list`) | One object with `ports` | Port names use OS conventions. |
+| Image and device info (`info`) | One object with `kind: "image"` and `components`, or `kind: "device"` with `transport`, `lines` and optional `storage_media` | An image argument is offline. Device queries use the shared USB/UART options. |
+| `env-check` | One object with build fields, configuration and access checks, and `image` | Reports each check separately. A nullable field means the check was unavailable or skipped. An optional image reports its own `ok` and error. |
+| `burn --plan` | One plan object with `mode`, `mode_name`, `total_bytes` and `components` | Offline and read-only. |
+| `burn` | NDJSON, one event per line | Uses the shared USB/UART options. Ctrl+C requests cancellation at the next safe point. |
+| `stats`, `sd-list`, `update` | One object per command. `stats --clear` returns `{"cleared":true}`. | Statistics use the per-user directory; disk identifiers and browser launch are OS-specific. |
+| Native debug (`write`, `read`, `writel`, `readl`, `exec`, `hexdump`, `fill`, `clear`, `memtest`, `shcmd`, `log`) | Unsupported | Uses the shared USB/UART options. |
+| `uart-monitor`, `install-usb-access` | Unsupported | Monitor auto-selects a unique USB serial port or the only serial port. USB access setup uses WinUSB on Windows and udev on Linux. |
+
+USB commands require a single device by default. To pick a target, use `--device` with a port path or `bus:address` from `scan`, or use `--uart PORT` with the OS port name. These two options are mutually exclusive. Bare `--uart` is equivalent to `--uart auto`. UART baud defaults to 115200; `--speed` can negotiate a higher rate and `--no-enter-upg` disables automatic entry. For safety, full-chip pre-erase always requires an explicit target.
+
+Text diagnostics go to stderr. JSON stdout is reserved for the payload. Operational errors may leave stdout empty, apart from the update error object and a burn's final result once the burn handler has started. Supplying `--json` to an unsupported command is a usage error.
+
+| Exit code | Meaning |
+| --- | --- |
+| `0` | Success, including an empty scan or a completed upgrade with reset unconfirmed. |
+| `1` | General failure such as a local I/O error or update check failure. |
+| `2` | Invalid options, image or burn plan. |
+| `3` | Missing, ambiguous or inaccessible target. |
+| `4` | Transfer or protocol failure, including device CRC mismatch. |
+| `10` | An update is available. |
+| `130` | Burn cancelled by the user. |
+
+The burn stream retains `stage`, `log`, `component_started`, `component_progress`, `overall_progress`, `component_finished` and `finished`. The terminal `result` carries `status`, `exit_code`, optional `error`, total and non-transfer time (`elapsed_secs`, `non_transfer_secs`), connection and reconnect time (`connection_secs`, `reconnect_secs`), `transfer_secs`, `bytes_sent`, `avg_rate_bps`, `components_completed`, `device_crcs_verified`, `upgrade_ended`, `reset` and `reset_error`. Progress `rate_bps` is computed over consecutive acknowledged payload chunks of the same component and is `null` until that component has two samples. The final average divides acknowledged firmware payload bytes by time spent in write transactions. It excludes USB padding, unselected components, setup, probes and reconnects.
+
+Reset values are `not_attempted`, `skipped`, `acknowledged`, `unconfirmed` and `failed`. An acknowledgement confirms the reset command response. An I/O failure after the reset header can leave the reboot unconfirmed, including when the device drops off USB before its final response. Upgrade completion, device CRC counts and reset status are separate outcomes.
+
 ![Native debug operations](../screenshots/debug.png)
 
 ## Storage inspection and erase previews

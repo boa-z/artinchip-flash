@@ -11,6 +11,8 @@ Cross-platform CLI and egui GUI for flashing ArtInChip SoCs over USB or UART, wi
 
 On a headless Debian 13 x86-64 server, install `artinchip-flash-cli-linux-x64.deb`. Use `artinchip-flash-linux-x64.deb` for both the CLI and desktop GUI. See [Linux installation](docs/en/usage.md#linux-installation) or [简体中文](docs/zh-CN/usage.md#linux-安装).
 
+CI also builds Intel macOS, Windows arm64 and Linux arm64 packages. These three variants are pending physical hardware testing. [Platform details](docs/en/development.md#hardware-validation) · [简体中文](docs/zh-CN/development.md#硬件验证)
+
 Download packages from [GitHub Releases](https://github.com/boa-z/artinchip-flash/releases), or build with the repository's pinned Rust toolchain. See the [build prerequisites](docs/en/development.md#build).
 
 ```sh
@@ -25,6 +27,8 @@ artinchip-flash scan
 artinchip-flash info firmware.img
 artinchip-flash burn firmware.img --plan --json
 ```
+
+`artinchip-flash --version` reports the application version, commit, build channel and target. For scripting, see the [CLI output and exit codes](docs/en/reference.md#cli-contract) or [简体中文](docs/zh-CN/reference.md#cli-契约).
 
 ![Burn page with a validated synthetic image](docs/screenshots/burn.jpg)
 

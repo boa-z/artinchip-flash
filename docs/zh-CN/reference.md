@@ -41,6 +41,40 @@
 | `sd-list` | 工具 → 列出物理磁盘（只读） |
 | `update` | 设置 → 检查更新 |
 
+## CLI 契约
+
+Windows x86-64、Linux x86-64 和 macOS arm64 共用命令、参数默认值、JSON 结构及退出码。平台差异包括设备列表、访问权限、路径格式、USB 访问配置、硬件支持和浏览器启动。使用 `serial-list` 获取系统串口名，例如 `COM4`、`/dev/ttyUSB0` 或 `/dev/cu.usbserial-*`。
+
+| 命令 | `--json` 输出 | 目标选择或平台说明 |
+| --- | --- | --- |
+| USB 发现（`scan`、`usb-list`） | 单个包含 `devices` 的对象 | 空扫描成功。`scan --require-device` 在结果为空时返回 `3`。无法获得的 USB 状态字段可以为 `null`。 |
+| 串口发现（`serial-list`） | 单个包含 `ports` 的对象 | 端口名称遵循系统约定。 |
+| 镜像和设备信息（`info`） | 单个对象，镜像以 `kind: "image"` 和 `components` 标识，设备以 `kind: "device"`、`transport`、`lines` 和可空的 `storage_media` 标识 | 指定镜像时离线查询。设备查询使用通用 USB/UART 选项。 |
+| `env-check` | 单个对象，包含构建信息、配置与访问检查、`image` | 分项报告。可空字段表示该项无法检查或已跳过。镜像检查提供 `ok` 和错误详情。 |
+| `burn --plan` | 单个对象，包含 `mode`、`mode_name`、`total_bytes` 和 `components` | 离线、只读。 |
+| `burn` | NDJSON，每行一个事件 | 使用通用 USB/UART 选项。Ctrl+C 在下一个安全点请求取消。 |
+| `stats`、`sd-list`、`update` | 每条命令输出一个对象。`stats --clear` 返回 `{"cleared":true}`。 | 统计使用用户目录。磁盘标识与浏览器启动遵循系统约定。 |
+| 原生调试（`write`、`read`、`writel`、`readl`、`exec`、`hexdump`、`fill`、`clear`、`memtest`、`shcmd`、`log`） | 暂不支持 | 使用通用 USB/UART 选项。 |
+| `uart-monitor`、`install-usb-access` | 暂不支持 | 监视器自动选择唯一 USB 串口或唯一串口。Windows 配置 WinUSB，Linux 配置 udev。 |
+
+USB 命令默认要求只有一个设备。用 `--device` 指定 `scan` 返回的端口路径或 `bus:address`，或用 `--uart PORT` 指定系统串口名，两者互斥。单独使用 `--uart` 等同于 `--uart auto`。串口默认波特率为 115200，可用 `--speed` 协商更高速率，用 `--no-enter-upg` 禁用自动进入升级模式。整片预擦除必须显式指定目标。
+
+诊断信息写入 stderr，JSON 数据写入 stdout。运行错误可能使 stdout 为空，更新查询的错误对象和进入烧录处理后的最终事件除外。对未支持的命令使用 `--json` 会返回参数错误。
+
+| 退出码 | 含义 |
+| --- | --- |
+| `0` | 成功，包括空扫描，以及升级完成但复位未确认。 |
+| `1` | 一般失败，例如本地 I/O 或更新检查失败。 |
+| `2` | 参数、镜像或烧录计划无效。 |
+| `3` | 目标缺失、不明确或无法访问。 |
+| `4` | 传输或协议失败，包括设备 CRC 不匹配。 |
+| `10` | 有可用更新。 |
+| `130` | 用户取消烧录。 |
+
+烧录流保留 `stage`、`log`、`component_started`、`component_progress`、`overall_progress`、`component_finished` 和 `finished`。最终 `result` 包含状态 `status`、退出码 `exit_code`、可空的 `error`、总耗时与非传输耗时（`elapsed_secs`、`non_transfer_secs`）、连接与重连耗时（`connection_secs`、`reconnect_secs`）、`transfer_secs`、`bytes_sent`、`avg_rate_bps`、`components_completed`、`device_crcs_verified`、`upgrade_ended`、`reset` 和 `reset_error`。进度的 `rate_bps` 用同一组件连续两次已应答数据块计算，首个样本返回 `null`。最终平均速率按已应答固件有效字节和写入事务耗时计算，排除 USB 填充、未选组件、准备、探测和重连。
+
+复位状态为 `not_attempted`、`skipped`、`acknowledged`、`unconfirmed` 或 `failed`。`acknowledged` 表示设备已应答复位命令。复位命令头发送后若遇到 I/O 错误，重启结果可能未确认，例如设备在最后一次应答前主动断开 USB。升级结束、设备 CRC 验证计数和复位状态分别报告。
+
 ![原生调试操作](../screenshots/debug.png)
 
 ## 存储查询与擦除预览
