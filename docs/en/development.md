@@ -46,6 +46,15 @@ The D213 hardware checklist is pending. Use a recoverable board and known-good f
 
 Update the root application's `Cargo.toml` version and `Cargo.lock`. The SDK's version is managed independently. CI requires a tag of exactly `v` plus the application version and embeds the `stable` channel in that build. A push to `main` builds `nightly` and refreshes its assets unless the commit message contains `[skip nightly]`. Other builds use `development`. `--version` reports the commit and target alongside the channel, and the build ID can end in `-dirty` when tracked files are modified. The stable workflow uploads to a draft and publishes after the uploads complete. Reruns leave existing published assets in place.
 
+## Commit messages
+
+Use [Conventional Commits 1.0.0](https://www.conventionalcommits.org/en/v1.0.0/) with the subject `<type>(<scope>): <summary>`. Scope is optional. Use a short, lowercase English imperative phrase without a trailing period. Keep independently reviewable changes in separate commits.
+
+- Use `feat` for features, `fix` for corrections, `docs` for documentation, `test` for tests, `ci` for workflows, `build` for packaging or dependencies, `refactor` for behavior-preserving changes, and `chore` for maintenance.
+- Use scopes such as `cli`, `updater`, `gui`, `sdk` or `release`. Examples include `fix(cli): reject ambiguous USB targets` and `ci: build native arm64 packages`.
+- After a blank line, use the body to explain the reason, compatibility impact or verification when useful. For an approved breaking change, add `!` before the colon and describe the impact and migration in a `BREAKING CHANGE:` footer.
+- When intentionally skipping a nightly publication, put `[skip nightly]` on its own line in the body. CI checks the full commit message.
+
 ## Licensing and provenance
 
 Project source, docs and authored assets use Apache-2.0. See [LICENSE](../../LICENSE) and [NOTICE](../../NOTICE). The Rust code implements wire layouts referenced in the [Luban-Lite bootloader and UPG sources](https://github.com/artinchip/luban-lite/tree/77fbe30dd2de366fae702ece84e1694153d94591). The parser uses firmware layout information from Luban-Lite's GPL-2.0-or-later `mk_image.py`. The distribution contains the independent Rust implementation and supports separately installed AiBurn tools.

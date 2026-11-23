@@ -46,6 +46,15 @@ D213 硬件验证待执行。使用可恢复的开发板和已知可用的固件
 
 更新根目录的应用 `Cargo.toml` 版本和 `Cargo.lock`。SDK 独立管理版本。CI 要求标签精确对应 `v` 加应用版本，并在该构建中嵌入 `stable` 渠道。推送到 `main` 时构建 `nightly` 并刷新附件，提交说明带 `[skip nightly]` 时跳过刷新。其他构建使用 `development`。`--version` 显示提交、目标和渠道，已跟踪文件有修改时构建标识可带 `-dirty` 后缀。稳定版先将附件上传到草稿，上传完成后发布，重跑时保留已有正式发行附件。
 
+## 提交说明
+
+遵循 [Conventional Commits 1.0.0](https://www.conventionalcommits.org/zh-hans/v1.0.0/)，标题格式为 `<type>(<scope>): <summary>`，可省略范围。摘要用简短的英文祈使短语，以小写开头，末尾省略句号。可独立审核的改动分别提交。
+
+- 新功能使用 `feat`，修复使用 `fix`，文档使用 `docs`，测试使用 `test`，工作流使用 `ci`，打包或依赖使用 `build`，保持行为的重构使用 `refactor`，维护使用 `chore`。
+- 范围可用 `cli`、`updater`、`gui`、`sdk` 或 `release` 等。例如 `fix(cli): reject ambiguous USB targets`、`ci: build native arm64 packages`。
+- 正文与标题之间空一行，用于说明原因、兼容性影响或验证结果。已批准的破坏性改动在冒号前加 `!`，并在 `BREAKING CHANGE:` 尾注记录影响和迁移方式。
+- 有意跳过 nightly 发布时，将 `[skip nightly]` 单独写在正文一行。CI 检查完整提交说明。
+
 ## 授权与来源
 
 项目源码、文档和自制资产采用 Apache-2.0，见 [LICENSE](../../LICENSE) 和 [NOTICE](../../NOTICE)。Rust 代码实现了 [Luban-Lite Bootloader 与 UPG 源码](https://github.com/artinchip/luban-lite/tree/77fbe30dd2de366fae702ece84e1694153d94591) 所记录的线格式。解析器参考 Luban-Lite 的 `mk_image.py`（GPL-2.0-or-later）中的固件布局。发行包包含独立的 Rust 实现，支持调用另行安装的 AiBurn 工具。
