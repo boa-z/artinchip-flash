@@ -4,9 +4,21 @@
 
 ## Installation
 
-Download your platform's package from [GitHub Releases](https://github.com/boa-z/artinchip-flash/releases). The Windows setup EXE and MSI, Linux DEB, and macOS arm64 PKG install both the CLI and GUI. Use the Windows ZIP or Linux/macOS tar.gz for portable use. Unsigned Windows and macOS installers may trigger system security prompts.
+Download your platform's package from [GitHub Releases](https://github.com/boa-z/artinchip-flash/releases). The Windows setup EXE and MSI and the macOS arm64 PKG install both the CLI and GUI. Use the Windows ZIP or macOS tar.gz for portable use. Unsigned Windows and macOS installers may trigger system security prompts.
 
 On Windows, **Tools → Driver** or `artinchip-flash install-usb-access` can install the WinUSB binding for `33c3:6677` with administrator privileges. On Linux, the same command installs the udev rule for non-root access. Reconnect the board after installation. macOS generally requires no kernel driver. If opening the device succeeds but transfers time out, close other USB tools and reconnect. In `scan --json`, `enumerated`, `ioreg_ready` and `protocol_ready` distinguish USB discovery, macOS descriptor readiness and a successful UPG probe.
+
+### Linux installation
+
+On headless Debian 13 amd64, install the CLI-only DEB from the directory where you downloaded it. It includes the CLI, documentation and the USB udev rule. The Linux x86-64 CLI supports CPUs without AVX or AVX2. CI exercises startup on QEMU's Nehalem CPU model.
+
+```sh
+sudo apt install ./artinchip-flash-cli-linux-x64.deb
+artinchip-flash --version
+artinchip-flash --help
+```
+
+Install `artinchip-flash-linux-x64.deb` for both binaries and the desktop launcher. APT replaces the installed variant when you switch packages. Both variants use the same user configuration and leave existing configuration, statistics and firmware in place. The Linux tar.gz still contains both binaries for portable use. The portable CLI needs the system libusb, libudev and CA certificates for GitHub update checks.
 
 ## Flashing over USB
 

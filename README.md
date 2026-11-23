@@ -9,10 +9,13 @@ Cross-platform CLI and egui GUI for flashing ArtInChip SoCs over USB or UART, wi
 
 ## Quick start
 
-Download a package from [GitHub Releases](https://github.com/boa-z/artinchip-flash/releases), or build the CLI and GUI with the repository's pinned Rust toolchain. See the [build prerequisites](docs/en/development.md#build).
+On a headless Debian 13 x86-64 server, install `artinchip-flash-cli-linux-x64.deb`. Use `artinchip-flash-linux-x64.deb` for both the CLI and desktop GUI. See [Linux installation](docs/en/usage.md#linux-installation) or [简体中文](docs/zh-CN/usage.md#linux-安装).
+
+Download packages from [GitHub Releases](https://github.com/boa-z/artinchip-flash/releases), or build with the repository's pinned Rust toolchain. See the [build prerequisites](docs/en/development.md#build).
 
 ```sh
 cargo build --locked --release --bins
+cargo build --locked --release --no-default-features --bin artinchip-flash
 ```
 
 Put the board in upgrade mode, check the image and preview the plan before selecting the target. See the [user guide](docs/en/usage.md) for installation, UART and GUI instructions.

@@ -18,7 +18,15 @@ fn main() {
         git_output(&["rev-parse", "--short=12", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
     let full_commit = git_output(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
     let dirty = Command::new("git")
-        .args(["diff", "--quiet", "--ignore-submodules", "HEAD", "--"])
+        .args([
+            "diff",
+            "--quiet",
+            "--ignore-submodules",
+            "HEAD",
+            "--",
+            ".",
+            ":(exclude)tools",
+        ])
         .status()
         .map(|status| !status.success())
         .unwrap_or(false);

@@ -14,7 +14,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest]
+        os: [windows-latest, ubuntu-24.04, macos-latest]
 
     steps:
       - uses: actions/checkout@v4
@@ -29,7 +29,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libusb-1.0-0-dev libudev-dev libxkbcommon-dev libwayland-dev libx11-dev libxi-dev libxcursor-dev libxrandr-dev libxinerama-dev libgl1-mesa-dev
+          sudo apt-get install -y pkg-config libusb-1.0-0-dev libudev-dev libxkbcommon-dev libwayland-dev libx11-dev libxi-dev libxcursor-dev libxrandr-dev libxinerama-dev libgl1-mesa-dev dpkg-dev
 
       - name: Install macOS dependencies
         if: runner.os == 'macOS'
@@ -77,7 +77,21 @@ jobs:
           python scripts/dependency_licenses.py --target "$target" --output THIRD-PARTY-LICENSES.txt
 
       - name: Build release binaries
+        if: runner.os != 'Linux'
         run: cargo build --locked --release --bins
+
+      - name: Build Linux release binaries and test the headless CLI
+        if: runner.os == 'Linux'
+        run: |
+          cargo test --locked --no-default-features --all-targets
+          cargo build --locked --release --bin artinchip-flash-gui
+          cargo build --locked --release --no-default-features --bin artinchip-flash
+          target="$(rustc -vV | sed -n 's/^host: //p')"
+          dependencies="$(cargo tree --locked --no-default-features --target "$target" --edges normal,build --prefix none)"
+          if grep -E '^(aws-lc-(rs|sys)|reqwest|openssl-sys|eframe|egui|rfd|image|winit|glutin) ' <<< "$dependencies"; then
+            exit 1
+          fi
+          python scripts/dependency_licenses.py --target "$target" --no-default-features --output THIRD-PARTY-LICENSES-CLI.txt
 
       - name: Package Windows artifacts
         if: runner.os == 'Windows'
@@ -259,81 +273,46 @@ jobs:
 
       - name: Package Linux artifacts
         if: runner.os == 'Linux'
-        run: |
-          system="$(printf '%s-%s' "$RUNNER_OS" "$RUNNER_ARCH" | tr '[:upper:]' '[:lower:]')"
-          archive="artinchip-flash-${system}.tar.gz"
-          version="$(awk -F\" '/^version =/ { print $2; exit }' Cargo.toml)"
-          case "$RUNNER_ARCH" in
-            X64) deb_arch="amd64" ;;
-            ARM64) deb_arch="arm64" ;;
-            *) deb_arch="$(dpkg --print-architecture)" ;;
-          esac
-          mkdir -p packages dist
-          cp target/release/artinchip-flash "dist/artinchip-flash-${system}"
-          cp target/release/artinchip-flash-gui "dist/artinchip-flash-gui-${system}"
-          cp README.md LICENSE NOTICE THIRD-PARTY-LICENSES.txt dist/
-          tar -czf "packages/$archive" -C dist .
+        run: bash scripts/package_linux.sh
 
-          pkgroot="deb-root"
-          mkdir -p "$pkgroot/DEBIAN" "$pkgroot/usr/bin" "$pkgroot/usr/share/applications" "$pkgroot/usr/share/doc/artinchip-flash" "$pkgroot/usr/share/icons/hicolor/256x256/apps" "$pkgroot/usr/lib/udev/rules.d"
-          install -m 0755 target/release/artinchip-flash "$pkgroot/usr/bin/artinchip-flash"
-          install -m 0755 target/release/artinchip-flash-gui "$pkgroot/usr/bin/artinchip-flash-gui"
-          install -m 0644 README.md "$pkgroot/usr/share/doc/artinchip-flash/README.md"
-          install -m 0644 LICENSE NOTICE THIRD-PARTY-LICENSES.txt "$pkgroot/usr/share/doc/artinchip-flash/"
-          install -m 0644 assets/icons/artinchip-flash-256.png "$pkgroot/usr/share/icons/hicolor/256x256/apps/artinchip-flash.png"
-          cat > "$pkgroot/usr/share/applications/artinchip-flash-gui.desktop" <<'EOF'
-          [Desktop Entry]
-          Type=Application
-          Name=artinchip-flash GUI
-          Comment=ArtInChip firmware flashing tool
-          Exec=artinchip-flash-gui
-          Icon=artinchip-flash
-          Terminal=false
-          Categories=Utility;Development;
-          EOF
-          cat > "$pkgroot/usr/lib/udev/rules.d/99-artinchip-flash.rules" <<'EOF'
-          SUBSYSTEM=="usb", ATTR{idVendor}=="33c3", ATTR{idProduct}=="6677", TAG+="uaccess", MODE="0666"
-          EOF
-          cat > "$pkgroot/DEBIAN/postinst" <<'EOF'
-          #!/bin/sh
-          set -e
-          if command -v udevadm >/dev/null 2>&1; then
-            udevadm control --reload-rules || true
-            udevadm trigger || true
-          fi
-          exit 0
-          EOF
-          cat > "$pkgroot/DEBIAN/postrm" <<'EOF'
-          #!/bin/sh
-          set -e
-          if command -v udevadm >/dev/null 2>&1; then
-            udevadm control --reload-rules || true
-          fi
-          exit 0
-          EOF
-          chmod 0755 "$pkgroot/DEBIAN/postinst" "$pkgroot/DEBIAN/postrm"
-          installed_size="$(du -sk "$pkgroot" | cut -f1)"
-          cat > "$pkgroot/DEBIAN/control" <<EOF
-          Package: artinchip-flash
-          Version: $version
-          Section: utils
-          Priority: optional
-          Architecture: $deb_arch
-          Installed-Size: $installed_size
-          Maintainer: boa-w
-          Depends: libc6, libusb-1.0-0, libudev1, libx11-6, libxi6, libxcursor1, libxrandr2, libxinerama1, libxkbcommon0, libgl1
-          Description: ArtInChip firmware flashing tool
-           Cross-platform CLI and GUI flasher for ArtInChip SoCs.
-          EOF
-          dpkg-deb --build "$pkgroot" "packages/artinchip-flash-${system}.deb"
-          test "$(dpkg-deb -f "packages/artinchip-flash-${system}.deb" Package)" = artinchip-flash
-          test "$(dpkg-deb -f "packages/artinchip-flash-${system}.deb" Version)" = "$version"
-          ldd target/release/artinchip-flash | grep -F 'libusb-1.0.so'
-          dpkg-deb -x "packages/artinchip-flash-${system}.deb" verified-deb
-          for file in LICENSE NOTICE THIRD-PARTY-LICENSES.txt; do
-            tar -xOf "packages/$archive" "./$file" | cmp "$file" -
-            cmp "$file" "verified-deb/usr/share/doc/artinchip-flash/$file"
-          done
+      - name: Verify Linux CLI runtime dependencies
+        if: runner.os == 'Linux'
+        run: |
+          bash scripts/check_linux_cli.sh target/release/artinchip-flash packages/artinchip-flash-cli-linux-x64.deb
+
+      - name: Test Debian 13 installation, non-AVX startup and package switching
+        if: runner.os == 'Linux'
+        run: |
+          docker run --rm --mount "type=bind,src=$PWD/packages,dst=/packages,readonly" debian:13-slim bash -euc '
+            export DEBIAN_FRONTEND=noninteractive
+            cli=/packages/artinchip-flash-cli-linux-x64.deb
+            full=/packages/artinchip-flash-linux-x64.deb
+            apt-get update
+            apt-get install -y --no-install-recommends "$cli"
+            artinchip-flash --help
+            artinchip-flash --version
+            test -f /usr/lib/udev/rules.d/99-artinchip-flash.rules
+            test ! -e /usr/bin/artinchip-flash-gui
+            if dpkg-query -W -f="\${db:Status-Abbrev} \${Package}\n" | grep -E "^ii +lib(x11|xcb|wayland|gl|egl|vulkan|llvm)"; then
+              exit 1
+            fi
+            apt-get install -y --no-install-recommends qemu-user
+            timeout --kill-after=5s 30s qemu-x86_64 -cpu Nehalem /usr/bin/artinchip-flash --help
+            timeout --kill-after=5s 30s qemu-x86_64 -cpu Nehalem /usr/bin/artinchip-flash --version
+            apt-get install -y --no-install-recommends "$full"
+            test -x /usr/bin/artinchip-flash-gui
+            test -f /usr/share/applications/artinchip-flash-gui.desktop
+            apt-get install -y --no-install-recommends xvfb xauth
+            gui_status=0
+            XDG_CONFIG_HOME="$(mktemp -d)" LIBGL_ALWAYS_SOFTWARE=1 xvfb-run -a \
+              timeout --kill-after=3s 8s artinchip-flash-gui || gui_status=$?
+            test "$gui_status" -eq 124
+            apt-get install -y --no-install-recommends "$cli"
+            dpkg-query -S /usr/bin/artinchip-flash | grep -Fx "artinchip-flash-cli: /usr/bin/artinchip-flash"
+            dpkg-query -S /usr/lib/udev/rules.d/99-artinchip-flash.rules | grep -Fx "artinchip-flash-cli: /usr/lib/udev/rules.d/99-artinchip-flash.rules"
+            test ! -e /usr/bin/artinchip-flash-gui
+            artinchip-flash --version
+          '
 
       - name: Package macOS artifacts
         if: runner.os == 'macOS'
@@ -474,6 +453,7 @@ jobs:
               `Automated nightly build from \`${context.sha}\`.`,
               '',
               'Portable archives and native installers are named as `artinchip-flash-<system>`.',
+              'For headless Linux x86-64, use `artinchip-flash-cli-linux-x64.deb`.',
             ].join('\n');
 
             let release;
@@ -550,6 +530,7 @@ jobs:
               `Release \`${tag}\` built from \`${context.sha}\`.`,
               '',
               'Portable archives and native installers are named as `artinchip-flash-<system>`.',
+              'For headless Linux x86-64, use `artinchip-flash-cli-linux-x64.deb`.',
               'The in-app updater (`artinchip-flash update`, GUI Settings) treats these `v*` tags as the stable channel.',
             ].join('\n');
 

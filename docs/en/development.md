@@ -4,10 +4,11 @@
 
 ## Build
 
-Install [rustup](https://rustup.rs) to use the toolchain pinned in `rust-toolchain.toml`. On Debian and Ubuntu install `libusb-1.0-0-dev`, `libudev-dev`, `pkg-config` and the Linux desktop dependencies from [CI](../../.github/workflows/ci.yml). On macOS use `brew install libusb`. Windows release builds use shared libusb through vcpkg. The egui GUI uses Glow and the Linux file dialog uses the desktop portal. Install `fonts-noto-cjk` if Chinese glyphs are missing on Linux.
+Install [rustup](https://rustup.rs) to use the toolchain pinned in `rust-toolchain.toml`. On Debian and Ubuntu the CLI needs a C toolchain, `libusb-1.0-0-dev`, `libudev-dev` and `pkg-config`. The default `gui` feature also needs the Linux desktop dependencies from [CI](../../.github/workflows/ci.yml). On macOS use `brew install libusb`. Windows release builds use shared libusb through vcpkg. The egui GUI uses Glow and the Linux file dialog uses the desktop portal. Install `fonts-noto-cjk` if Chinese glyphs are missing on Linux.
 
 ```sh
 cargo build --locked --release --bins
+cargo build --locked --release --no-default-features --bin artinchip-flash
 ```
 
 The CLI and GUI binaries are under `target/release/`.
@@ -19,11 +20,14 @@ cargo fmt --all -- --check
 cargo check --locked --workspace --all-targets
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace --all-targets
+cargo test --locked --no-default-features --all-targets
 cargo check --locked -p artinchip-flash --no-default-features
 cargo check --locked -p artinchip-flash --no-default-features --features usb
 cargo check --locked -p artinchip-flash --no-default-features --features uart
 python3 scripts/check_sdk_consumer.py
 ```
+
+On Linux x86-64, `qemu-x86_64 -cpu Nehalem target/release/artinchip-flash --help` and the same command with `--version` exercise the release CLI on a non-AVX CPU model. CI checks `ldd` and the CLI DEB's `Depends`, then checks package installation, CLI startup under QEMU, GUI startup under Xvfb and package switching on Debian 13. Update checks use Rustls with ring and the platform trust store.
 
 The suite exercises fixed protocol vectors, firmware validation, command ordering, failure handling and CLI output using synthetic images and scripted transports. The external SDK check builds a separate Cargo project without USB, UART or GUI dependencies and runs a simulated partition upgrade through the public API.
 

@@ -4,9 +4,21 @@
 
 ## 安装
 
-在 [GitHub Releases](https://github.com/boa-z/artinchip-flash/releases) 下载对应平台的安装包。Windows 的安装向导 EXE 和 MSI、Linux 的 DEB、macOS arm64 的 PKG 均安装 CLI 和 GUI。便携版可选 Windows ZIP 或 Linux/macOS tar.gz。未签名的 Windows 和 macOS 安装包可能触发系统安全提示。
+在 [GitHub Releases](https://github.com/boa-z/artinchip-flash/releases) 下载对应平台的安装包。Windows 的安装向导 EXE 和 MSI、macOS arm64 的 PKG 均安装 CLI 和 GUI。便携版可选 Windows ZIP 或 macOS tar.gz。未签名的 Windows 和 macOS 安装包可能触发系统安全提示。
 
 Windows 下使用「工具 → 驱动」或 `artinchip-flash install-usb-access`，可以管理员权限为 `33c3:6677` 安装 WinUSB 绑定。Linux 下同一命令会安装 udev 规则，允许普通用户访问。安装后重新连接开发板。macOS 通常无需内核驱动。若设备能打开但传输超时，关闭其他 USB 工具后重连。`scan --json` 中的 `enumerated`、`ioreg_ready` 和 `protocol_ready` 分别表示 USB 枚举、macOS 描述符就绪和 UPG 探测成功。
+
+### Linux 安装
+
+在无桌面的 Debian 13 amd64 上，进入下载目录后安装纯 CLI DEB。包内包含命令行程序、文档和 USB udev 规则。Linux x86-64 CLI 支持没有 AVX 或 AVX2 的 CPU。CI 使用 QEMU 的 Nehalem CPU 模型测试启动。
+
+```sh
+sudo apt install ./artinchip-flash-cli-linux-x64.deb
+artinchip-flash --version
+artinchip-flash --help
+```
+
+需要 CLI、GUI 和桌面启动器时，安装 `artinchip-flash-linux-x64.deb`。切换版本时，APT 会替换已安装的另一种包。两种包使用同一用户配置目录，保留现有配置、统计和固件。Linux tar.gz 便携包仍包含两个程序。便携版 CLI 使用系统的 libusb 和 libudev，GitHub 更新检查还需要系统 CA 证书。
 
 ## USB 烧录
 

@@ -4,10 +4,11 @@
 
 ## 构建
 
-安装 [rustup](https://rustup.rs) 以使用 `rust-toolchain.toml` 锁定的工具链。Debian 和 Ubuntu 需安装 `libusb-1.0-0-dev`、`libudev-dev`、`pkg-config` 以及 [CI](../../.github/workflows/ci.yml) 中列出的 Linux 桌面依赖。macOS 使用 `brew install libusb`。Windows 发布构建通过 vcpkg 链接共享 libusb。egui 界面使用 Glow，Linux 文件对话框使用桌面门户。Linux 缺少中文字形时可安装 `fonts-noto-cjk`。
+安装 [rustup](https://rustup.rs) 以使用 `rust-toolchain.toml` 锁定的工具链。在 Debian 和 Ubuntu 上，纯 CLI 构建需要 C 工具链、`libusb-1.0-0-dev`、`libudev-dev` 和 `pkg-config`。默认启用 `gui` 特性，还需要 [CI](../../.github/workflows/ci.yml) 中列出的 Linux 桌面依赖。macOS 使用 `brew install libusb`。Windows 发布构建通过 vcpkg 链接共享 libusb。egui 界面使用 Glow，Linux 文件对话框使用桌面门户。Linux 缺少中文字形时可安装 `fonts-noto-cjk`。
 
 ```sh
 cargo build --locked --release --bins
+cargo build --locked --release --no-default-features --bin artinchip-flash
 ```
 
 CLI 和 GUI 可执行文件位于 `target/release/`。
@@ -19,11 +20,14 @@ cargo fmt --all -- --check
 cargo check --locked --workspace --all-targets
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace --all-targets
+cargo test --locked --no-default-features --all-targets
 cargo check --locked -p artinchip-flash --no-default-features
 cargo check --locked -p artinchip-flash --no-default-features --features usb
 cargo check --locked -p artinchip-flash --no-default-features --features uart
 python3 scripts/check_sdk_consumer.py
 ```
+
+在 Linux x86-64 上，运行 `qemu-x86_64 -cpu Nehalem target/release/artinchip-flash --help`，再用同一命令运行 `--version`，即可在无 AVX 的 CPU 模型下测试发布版 CLI。CI 检查 `ldd` 和 CLI DEB 的 `Depends`，并在 Debian 13 上验证安装、QEMU 下的 CLI 启动、Xvfb 下的 GUI 启动和包切换。更新检查使用 Rustls、ring 和系统证书库。
 
 测试使用合成镜像和脚本化传输，覆盖固定协议向量、固件校验、命令顺序、故障处理和 CLI 输出。外部 SDK 检查会构建一个独立 Cargo 项目，确认其依赖不含 USB、UART 或 GUI，再通过公共 API 执行模拟分区升级。
 

@@ -28,11 +28,24 @@ REVIEWED_TERMS = {
 NOTICE_FILE = re.compile(r"(?:licen[cs]es?|copying|copyright|notice|authors)(?:[._-].*)?$", re.I)
 
 
-def metadata(target):
+def metadata(target, no_default_features):
     command = ["cargo", "metadata", "--locked", "--format-version", "1"]
     if target:
         command += ["--filter-platform", target]
+    if no_default_features:
+        command += ["--no-default-features"]
     return json.loads(subprocess.check_output(command))["packages"]
+
+
+def build_packages(target, no_default_features, packages):
+    command = [
+        "cargo", "tree", "--locked", "--target", target,
+        "--edges", "normal,build", "--prefix", "none", "--format", "{p}",
+    ]
+    if no_default_features:
+        command += ["--no-default-features"]
+    used = {tuple(line.split()[:2]) for line in subprocess.check_output(command, text=True).splitlines()}
+    return [package for package in packages if (package["name"], f"v{package['version']}") in used]
 
 
 def check_licenses(packages):
@@ -143,17 +156,18 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target", help="Rust target triple for the release dependency graph")
     parser.add_argument("--output", type=Path, help="Generate an attribution file for --target")
+    parser.add_argument("--no-default-features", action="store_true", help="Audit the CLI-only graph")
     args = parser.parse_args()
     if args.output and not args.target:
         parser.error("--output requires --target")
-
-    packages = metadata(args.target)
+    packages = metadata(args.target, args.no_default_features)
     licenses = check_licenses(packages)
     print(f"Reviewed {len(packages)} Cargo packages ({len(licenses)} license expressions)")
     for expression, count in sorted(licenses.items()):
         print(f"{count:3}  {expression}")
     if args.output:
-        write_attributions(args.output, [package for package in packages if package["source"]])
+        dependencies = build_packages(args.target, args.no_default_features, packages)
+        write_attributions(args.output, [package for package in dependencies if package["source"]])
 
 
 if __name__ == "__main__":
